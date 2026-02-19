@@ -9,7 +9,7 @@ add without writing compositor specific code.
 
 Who is this for?
 ===
-In it's current state, this is sufficient for the window manager uber nerds comfortable with:
+In its current state, this is sufficient for the window manager uber nerds comfortable with:
 
 * Tiling/scrolling WM
 * Vim/Emacs key bindings all the things
@@ -21,8 +21,8 @@ In it's current state, this is sufficient for the window manager uber nerds comf
 Please note
 ===
 **This may not be the Talon you know and love**. If you are used to running Talon under a Linux X11, Mac or Windows
-environment - it could be missing some features you are used to (example: application specific commands).
-
+environment - this will be missing a significant amount of the features you are used to. This only provides an input
+layer for Talon to provide raw input to Wayland based compositors.
 
 Current supported back ends
 ===
