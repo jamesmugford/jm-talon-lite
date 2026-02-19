@@ -21,7 +21,7 @@ In its current state, this is sufficient for the window manager uber nerds comfo
 Please note
 ===
 **This may not be the Talon you know and love**. If you are used to running Talon under a Linux X11, Mac or Windows
-environment - this will be missing a significant amount of the features you are used to. This only provides an input
+environment - this will be break a significant number of the features you are used to. This only provides an input
 layer for Talon to provide raw input to Wayland based compositors.
 
 Current supported back ends
