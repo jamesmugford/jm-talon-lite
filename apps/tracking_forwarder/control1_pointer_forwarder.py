@@ -1,10 +1,23 @@
 import subprocess
 
-from talon import Context, Module, actions, app, tracking_system, ui
+from talon import Context, Module, actions, app, settings, tracking_system, ui
 from talon.plugins import eye_mouse
 
 ctx = Context()
 mod = Module()
+
+mod.setting(
+    "control1_pointer_forwarder_autostart",
+    type=bool,
+    default=False,
+    desc="Auto-start control1 pointer forwarder on Talon startup.",
+)
+mod.setting(
+    "control1_pointer_forwarder_autostart_log",
+    type=bool,
+    default=True,
+    desc="Log when control1 pointer forwarder auto-starts.",
+)
 
 _pointer_armed = False
 _gaze_registered = False
@@ -218,6 +231,14 @@ class Actions:
 def _on_ready() -> None:
     ui.register("screen_change", _on_screen_change)
     _refresh_desktop_bounds()
+    if settings.get("user.control1_pointer_forwarder_autostart"):
+        actions.user.control1_pointer_forwarder_start()
+        if settings.get("user.control1_pointer_forwarder_autostart_log"):
+            print(
+                "control1 pointer forwarder autostarted "
+                f"enabled={actions.tracking.control1_enabled()}"
+            )
+        return
     _sync_pointer_forwarding()
 
 
