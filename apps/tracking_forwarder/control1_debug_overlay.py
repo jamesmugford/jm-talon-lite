@@ -166,10 +166,10 @@ class Actions:
     def control1_debug_overlay_toggle(state=None) -> None:
         """Toggle control1 debug overlay."""
         target = (not _overlay_enabled) if state is None else state
-        if target:
-            actions.user.control1_debug_overlay_start()
+        if not target:
+            actions.user.control1_debug_overlay_stop()
             return
-        actions.user.control1_debug_overlay_stop()
+        actions.user.control1_debug_overlay_start()
 
     @staticmethod
     def control1_debug_overlay_running() -> bool:

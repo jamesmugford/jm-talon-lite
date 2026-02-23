@@ -217,10 +217,10 @@ class Actions:
     def control1_pointer_forwarder_toggle(state: bool | None = None) -> None:
         """Toggle control1 pointer forwarding."""
         target = (not _pointer_armed) if state is None else bool(state)
-        if target:
-            actions.user.control1_pointer_forwarder_start()
+        if not target:
+            actions.user.control1_pointer_forwarder_stop()
             return
-        actions.user.control1_pointer_forwarder_stop()
+        actions.user.control1_pointer_forwarder_start()
 
     @staticmethod
     def control1_pointer_forwarder_running() -> bool:

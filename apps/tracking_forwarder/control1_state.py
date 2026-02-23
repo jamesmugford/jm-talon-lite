@@ -34,8 +34,9 @@ def _install_menu_hook() -> bool:
         before = actions.tracking.control1_enabled()
         result = orig_cb(menu_item)
         after = actions.tracking.control1_enabled()
-        if after != before:
-            _emit_legacy_state(after)
+        if after == before:
+            return result
+        _emit_legacy_state(after)
         return result
 
     attrs["cb"] = wrapped

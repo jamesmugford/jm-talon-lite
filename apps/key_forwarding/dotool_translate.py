@@ -160,10 +160,10 @@ def _split_modifiers(chord: str) -> tuple[tuple[str, ...], str]:
     mods: list[str] = []
     key_parts: list[str] = []
     for part in parts:
-        if not key_parts and part in MODIFIER_ALIASES:
-            mods.append(MODIFIER_ALIASES[part])
-        else:
+        if key_parts or part not in MODIFIER_ALIASES:
             key_parts.append(part)
+            continue
+        mods.append(MODIFIER_ALIASES[part])
     return tuple(mods), "-".join(key_parts)
 
 
