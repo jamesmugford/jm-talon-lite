@@ -1,6 +1,8 @@
 from talon import Context, Module, actions, app
 from talon.plugins import eye_mouse_2
 
+from .core import should_emit_state_change
+
 ctx = Context()
 mod = Module()
 
@@ -34,7 +36,7 @@ def _install_menu_hook() -> bool:
         before = actions.tracking.control1_enabled()
         result = orig_cb(menu_item)
         after = actions.tracking.control1_enabled()
-        if after == before:
+        if not should_emit_state_change(before, after):
             return result
         _emit_legacy_state(after)
         return result
@@ -52,7 +54,7 @@ class TrackingActions:
         before = actions.tracking.control1_enabled()
         actions.next(state)
         after = actions.tracking.control1_enabled()
-        if after == before:
+        if not should_emit_state_change(before, after):
             return
         _emit_legacy_state(after)
 

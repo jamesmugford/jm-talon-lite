@@ -41,3 +41,11 @@ Install Wayland compatible input backend:
 * Currently supported: **Dotool:** https://git.sr.ht/~geb/dotool
 
 dotoold will need to be run in the background, which can be started with systemd.
+
+## Dev tests
+
+Run minimal pure-function tests:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
+```

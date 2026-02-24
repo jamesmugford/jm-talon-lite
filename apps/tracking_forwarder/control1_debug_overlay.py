@@ -2,6 +2,8 @@ from talon import Context, Module, actions, app, tracking_system, ui
 from talon.canvas import Canvas
 from talon.plugins import eye_mouse
 
+from .core import rect_local_point
+
 ctx = Context()
 mod = Module()
 
@@ -11,21 +13,17 @@ _dot_pos = None
 _canvas_entries = []
 
 
-def _contains(rect, x: float, y: float) -> bool:
-    return rect.x <= x <= rect.x + rect.width and rect.y <= y <= rect.y + rect.height
-
-
 def _make_draw(rect):
     def _draw(c):
         if _dot_pos is None:
             return
 
         x, y = _dot_pos
-        if not _contains(rect, x, y):
+        local_point = rect_local_point(rect, x, y)
+        if local_point is None:
             return
 
-        lx = x - rect.x
-        ly = y - rect.y
+        lx, ly = local_point
 
         c.paint.style = c.paint.Style.STROKE
         c.paint.color = "00ff00cc"
@@ -53,7 +51,8 @@ def _create_canvases() -> None:
 
     entries = []
     for screen in ui.screens():
-        draw_cb = _make_draw(screen.rect)
+        rect = screen.rect
+        draw_cb = _make_draw((rect.x, rect.y, rect.width, rect.height))
         canvas = Canvas.from_screen(screen)
         canvas.register("draw", draw_cb)
         entries.append((canvas, draw_cb))
@@ -163,7 +162,7 @@ class Actions:
         print("control1 debug overlay stopped")
 
     @staticmethod
-    def control1_debug_overlay_toggle(state=None) -> None:
+    def control1_debug_overlay_toggle(state: bool | None = None) -> None:
         """Toggle control1 debug overlay."""
         target = (not _overlay_enabled) if state is None else state
         if not target:

@@ -6,11 +6,16 @@ from talon import Context, actions
 ctx = Context()
 
 
+def _dotool_click_payload(button: str) -> str:
+    """Return dotool click payload for a mouse button name."""
+    return f"click {button}\n"
+
+
 def _dotool_left_click() -> None:
     try:
         subprocess.run(
             ["dotoolc"],
-            input="click left\n",
+            input=_dotool_click_payload("left"),
             text=True,
             check=False,
             timeout=0.5,

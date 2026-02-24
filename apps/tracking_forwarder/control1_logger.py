@@ -1,6 +1,8 @@
 from talon import Context, Module, actions, app, tracking_system
 from talon.plugins import eye_mouse
 
+from .core import format_legacy_sample
+
 ctx = Context()
 mod = Module()
 
@@ -17,18 +19,12 @@ def _legacy_sample_line() -> str:
     d = m.delta_hist[-1] if m.delta_hist else None
     g = m.eye_hist[-1]
 
-    if d is None:
-        return (
-            f"eye_legacy ts={g.ts:.3f} "
-            f"xy_px=({xy.x:.1f},{xy.y:.1f}) "
-            f"gaze_norm=({g.gaze.x:.3f},{g.gaze.y:.3f})"
-        )
-
-    return (
-        f"eye_legacy ts={g.ts:.3f} "
-        f"xy_px=({xy.x:.1f},{xy.y:.1f}) "
-        f"delta=({d.x:.2f},{d.y:.2f}) "
-        f"gaze_norm=({g.gaze.x:.3f},{g.gaze.y:.3f})"
+    delta = None if d is None else (d.x, d.y)
+    return format_legacy_sample(
+        timestamp=g.ts,
+        xy_px=(xy.x, xy.y),
+        gaze_norm=(g.gaze.x, g.gaze.y),
+        delta=delta,
     )
 
 

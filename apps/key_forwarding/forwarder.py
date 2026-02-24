@@ -4,7 +4,11 @@ from talon import Context, Module, actions, settings
 import subprocess
 import sys
 
-from .dotool_translate import KeySpec, talon_key_to_dotool_actions
+from .dotool_translate import (
+    KeySpec,
+    dotool_actions_to_input,
+    talon_key_to_dotool_actions,
+)
 
 mod = Module()
 mod.setting(
@@ -38,7 +42,7 @@ class MainActions:
             # Send a small batch to dotoolc (dotoold should be running).
             subprocess.run(
                 ["dotoolc"],
-                input="\n".join(actions_list) + "\n",
+                input=dotool_actions_to_input(actions_list),
                 text=True,
                 check=False,
                 timeout=0.5,

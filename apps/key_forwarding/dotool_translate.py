@@ -76,6 +76,13 @@ def talon_key_to_dotool_actions(
     ]
 
 
+def dotool_actions_to_input(actions: DotoolActions) -> str:
+    """Build newline-delimited dotool stdin payload from actions."""
+    if not actions:
+        return ""
+    return "\n".join(actions) + "\n"
+
+
 def _dotool_actions_for_chord(
     chord: str, log_unknown: LogUnknownKey | None
 ) -> DotoolActions:

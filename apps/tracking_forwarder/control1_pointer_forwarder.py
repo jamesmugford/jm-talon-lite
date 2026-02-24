@@ -3,6 +3,8 @@ import subprocess
 from talon import Context, Module, actions, app, settings, tracking_system, ui
 from talon.plugins import eye_mouse
 
+from .core import desktop_bounds_from_rects, normalize_point
+
 ctx = Context()
 mod = Module()
 
@@ -27,28 +29,11 @@ _desktop_bounds = (0.0, 0.0, 1.0, 1.0)
 
 def _refresh_desktop_bounds() -> None:
     global _desktop_bounds
-    screens = list(ui.screens())
-    if not screens:
-        _desktop_bounds = (0.0, 0.0, 1.0, 1.0)
-        return
-
-    left = min(screen.rect.x for screen in screens)
-    top = min(screen.rect.y for screen in screens)
-    right = max(screen.rect.x + screen.rect.width for screen in screens)
-    bottom = max(screen.rect.y + screen.rect.height for screen in screens)
-
-    width = max(1.0, right - left)
-    height = max(1.0, bottom - top)
-    _desktop_bounds = (left, top, width, height)
-
-
-def _normalize_point(x_px: float, y_px: float) -> tuple[float, float]:
-    left, top, width, height = _desktop_bounds
-    x = (x_px - left) / width
-    y = (y_px - top) / height
-    x = 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
-    y = 0.0 if y < 0.0 else 1.0 if y > 1.0 else y
-    return x, y
+    rects = [
+        (screen.rect.x, screen.rect.y, screen.rect.width, screen.rect.height)
+        for screen in ui.screens()
+    ]
+    _desktop_bounds = desktop_bounds_from_rects(rects)
 
 
 def _close_dotool_proc() -> None:
@@ -171,7 +156,7 @@ def _on_gaze(*_args) -> None:
         return
 
     point = hist[-1]
-    x, y = _normalize_point(point.x, point.y)
+    x, y = normalize_point(_desktop_bounds, point.x, point.y)
     _send_dotool_line(f"mouseto {x:.6f} {y:.6f}")
 
 
