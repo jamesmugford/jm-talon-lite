@@ -1,11 +1,10 @@
 import subprocess
 
-from talon import Context, Module, actions, app, settings, tracking_system, ui
+from talon import Module, actions, app, settings, tracking_system, ui
 from talon.plugins import eye_mouse
 
 from .core import desktop_bounds_from_rects, normalize_point
 
-ctx = Context()
 mod = Module()
 
 mod.setting(
@@ -21,8 +20,6 @@ mod.setting(
     desc="Log when control1 pointer forwarder auto-starts.",
 )
 
-_pointer_armed = False
-_gaze_registered = False
 _dotool_proc = None
 _desktop_bounds = (0.0, 0.0, 1.0, 1.0)
 
@@ -113,42 +110,23 @@ def _send_dotool_line(line: str) -> None:
         _close_dotool_proc()
 
 
+def _clear_gaze_subscriptions() -> None:
+    for _ in range(16):
+        tracking_system.unregister("gaze", _on_gaze)
+
+
 def _register_gaze() -> None:
-    global _gaze_registered
-    if _gaze_registered:
-        return
+    _clear_gaze_subscriptions()
     tracking_system.register("gaze", _on_gaze)
-    _gaze_registered = True
 
 
 def _unregister_gaze() -> None:
-    global _gaze_registered
-    if not _gaze_registered:
-        return
-    tracking_system.unregister("gaze", _on_gaze)
-    _gaze_registered = False
-
-
-def _sync_pointer_forwarding() -> None:
-    if not _pointer_armed:
-        _unregister_gaze()
-        _close_dotool_proc()
-        return
-
-    if not actions.tracking.control1_enabled():
-        _unregister_gaze()
-        _close_dotool_proc()
-        return
-
-    _refresh_desktop_bounds()
-    _register_gaze()
+    _clear_gaze_subscriptions()
 
 
 def _on_gaze(*_args) -> None:
-    if not _pointer_armed:
-        return
-
     if not actions.tracking.control1_enabled():
+        _close_dotool_proc()
         return
 
     hist = eye_mouse.mouse.xy_hist
@@ -164,27 +142,13 @@ def _on_screen_change(_screens) -> None:
     _refresh_desktop_bounds()
 
 
-@ctx.action_class("user")
-class UserActions:
-    @staticmethod
-    def control1_started() -> None:
-        actions.next()
-        _sync_pointer_forwarding()
-
-    @staticmethod
-    def control1_stopped() -> None:
-        actions.next()
-        _sync_pointer_forwarding()
-
-
 @mod.action_class
 class Actions:
     @staticmethod
     def control1_pointer_forwarder_start() -> None:
         """Start control1 pointer forwarding through dotool mouseto."""
-        global _pointer_armed
-        _pointer_armed = True
-        _sync_pointer_forwarding()
+        _refresh_desktop_bounds()
+        _register_gaze()
         print(
             "control1 pointer forwarder started "
             f"enabled={actions.tracking.control1_enabled()}"
@@ -193,24 +157,18 @@ class Actions:
     @staticmethod
     def control1_pointer_forwarder_stop() -> None:
         """Stop control1 pointer forwarding."""
-        global _pointer_armed
-        _pointer_armed = False
-        _sync_pointer_forwarding()
+        _unregister_gaze()
+        _close_dotool_proc()
         print("control1 pointer forwarder stopped")
 
     @staticmethod
     def control1_pointer_forwarder_toggle(state: bool | None = None) -> None:
-        """Toggle control1 pointer forwarding."""
-        target = (not _pointer_armed) if state is None else bool(state)
+        """Enable or disable control1 pointer forwarding."""
+        target = True if state is None else bool(state)
         if not target:
             actions.user.control1_pointer_forwarder_stop()
             return
         actions.user.control1_pointer_forwarder_start()
-
-    @staticmethod
-    def control1_pointer_forwarder_running() -> bool:
-        """Return whether control1 pointer forwarding is armed."""
-        return _pointer_armed
 
 
 def _on_ready() -> None:
@@ -224,7 +182,6 @@ def _on_ready() -> None:
                 f"enabled={actions.tracking.control1_enabled()}"
             )
         return
-    _sync_pointer_forwarding()
 
 
 app.register("ready", _on_ready)
