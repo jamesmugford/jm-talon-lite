@@ -53,19 +53,19 @@ class TrackingForwarderCoreTests(unittest.TestCase):
         self.assertEqual(self.core.rect_local_point(rect, 110.0, 80.0), (100.0, 60.0))
         self.assertIsNone(self.core.rect_local_point(rect, 9.9, 25.0))
 
-    def test_format_legacy_sample(self):
-        line_no_delta = self.core.format_legacy_sample(
+    def test_format_control1_sample(self):
+        line_no_delta = self.core.format_control1_sample(
             timestamp=1.2345,
             xy_px=(100.0, 200.0),
             gaze_norm=(0.25, 0.75),
             delta=None,
         )
-        self.assertIn("eye_legacy ts=1.234", line_no_delta)
+        self.assertIn("control1 ts=1.234", line_no_delta)
         self.assertIn("xy_px=(100.0,200.0)", line_no_delta)
         self.assertIn("gaze_norm=(0.250,0.750)", line_no_delta)
         self.assertNotIn("delta=", line_no_delta)
 
-        line_with_delta = self.core.format_legacy_sample(
+        line_with_delta = self.core.format_control1_sample(
             timestamp=2.0,
             xy_px=(50.0, 60.0),
             gaze_norm=(0.1, 0.2),

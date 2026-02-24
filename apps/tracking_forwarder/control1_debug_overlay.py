@@ -125,12 +125,12 @@ def _on_screen_change(_screens) -> None:
 @ctx.action_class("user")
 class UserActions:
     @staticmethod
-    def eye_legacy_started() -> None:
+    def control1_started() -> None:
         actions.next()
         _sync_overlay()
 
     @staticmethod
-    def eye_legacy_stopped() -> None:
+    def control1_stopped() -> None:
         actions.next()
         _sync_overlay()
 
@@ -164,7 +164,7 @@ class Actions:
     @staticmethod
     def control1_debug_overlay_toggle(state: bool | None = None) -> None:
         """Toggle control1 debug overlay."""
-        target = (not _overlay_enabled) if state is None else state
+        target = (not _overlay_enabled) if state is None else bool(state)
         if not target:
             actions.user.control1_debug_overlay_stop()
             return

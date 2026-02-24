@@ -167,12 +167,12 @@ def _on_screen_change(_screens) -> None:
 @ctx.action_class("user")
 class UserActions:
     @staticmethod
-    def eye_legacy_started() -> None:
+    def control1_started() -> None:
         actions.next()
         _sync_pointer_forwarding()
 
     @staticmethod
-    def eye_legacy_stopped() -> None:
+    def control1_stopped() -> None:
         actions.next()
         _sync_pointer_forwarding()
 

@@ -60,22 +60,22 @@ def rect_local_point(rect: RectTuple, x: float, y: float) -> PointTuple | None:
     return (x - rect_x, y - rect_y)
 
 
-def format_legacy_sample(
+def format_control1_sample(
     timestamp: float,
     xy_px: PointTuple,
     gaze_norm: PointTuple,
     delta: PointTuple | None,
 ) -> str:
-    """Format one legacy tracking sample log line."""
+    """Format one control1 tracking sample log line."""
     if delta is None:
         return (
-            f"eye_legacy ts={timestamp:.3f} "
+            f"control1 ts={timestamp:.3f} "
             f"xy_px=({xy_px[0]:.1f},{xy_px[1]:.1f}) "
             f"gaze_norm=({gaze_norm[0]:.3f},{gaze_norm[1]:.3f})"
         )
 
     return (
-        f"eye_legacy ts={timestamp:.3f} "
+        f"control1 ts={timestamp:.3f} "
         f"xy_px=({xy_px[0]:.1f},{xy_px[1]:.1f}) "
         f"delta=({delta[0]:.2f},{delta[1]:.2f}) "
         f"gaze_norm=({gaze_norm[0]:.3f},{gaze_norm[1]:.3f})"

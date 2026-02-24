@@ -1,26 +1,26 @@
 from talon import Context, Module, actions, app, tracking_system
 from talon.plugins import eye_mouse
 
-from .core import format_legacy_sample
+from .core import format_control1_sample
 
 ctx = Context()
 mod = Module()
 
-_eye_legacy_log_armed = True
-_eye_legacy_gaze_registered = False
+_control1_gaze_logger_armed = True
+_control1_gaze_subscribed = False
 
 
-def _legacy_sample_line() -> str:
+def _control1_sample_line() -> str:
     m = eye_mouse.mouse
     if not m.xy_hist or not m.eye_hist:
-        return "eye_legacy no samples"
+        return "control1 no samples"
 
     xy = m.xy_hist[-1]
     d = m.delta_hist[-1] if m.delta_hist else None
     g = m.eye_hist[-1]
 
     delta = None if d is None else (d.x, d.y)
-    return format_legacy_sample(
+    return format_control1_sample(
         timestamp=g.ts,
         xy_px=(xy.x, xy.y),
         gaze_norm=(g.gaze.x, g.gaze.y),
@@ -29,31 +29,31 @@ def _legacy_sample_line() -> str:
 
 
 def _on_gaze(*_args) -> None:
-    if not _eye_legacy_log_armed:
+    if not _control1_gaze_logger_armed:
         return
     if not actions.tracking.control1_enabled():
         return
-    print(_legacy_sample_line())
+    print(_control1_sample_line())
 
 
 def _register_gaze() -> None:
-    global _eye_legacy_gaze_registered
-    if _eye_legacy_gaze_registered:
+    global _control1_gaze_subscribed
+    if _control1_gaze_subscribed:
         return
     tracking_system.register("gaze", _on_gaze)
-    _eye_legacy_gaze_registered = True
+    _control1_gaze_subscribed = True
 
 
 def _unregister_gaze() -> None:
-    global _eye_legacy_gaze_registered
-    if not _eye_legacy_gaze_registered:
+    global _control1_gaze_subscribed
+    if not _control1_gaze_subscribed:
         return
     tracking_system.unregister("gaze", _on_gaze)
-    _eye_legacy_gaze_registered = False
+    _control1_gaze_subscribed = False
 
 
 def _sync_gaze_logging() -> None:
-    if not _eye_legacy_log_armed:
+    if not _control1_gaze_logger_armed:
         _unregister_gaze()
         return
 
@@ -67,12 +67,12 @@ def _sync_gaze_logging() -> None:
 @ctx.action_class("user")
 class UserActions:
     @staticmethod
-    def eye_legacy_started() -> None:
+    def control1_started() -> None:
         actions.next()
         _sync_gaze_logging()
 
     @staticmethod
-    def eye_legacy_stopped() -> None:
+    def control1_stopped() -> None:
         actions.next()
         _sync_gaze_logging()
 
@@ -80,34 +80,33 @@ class UserActions:
 @mod.action_class
 class Actions:
     @staticmethod
-    def eye_legacy_log_start(interval: str = "100ms") -> None:
-        """Enable legacy eye logger (gaze-event driven)."""
-        global _eye_legacy_log_armed
-        _eye_legacy_log_armed = True
+    def control1_gaze_logger_start() -> None:
+        """Enable control1 gaze logger (gaze-event driven)."""
+        global _control1_gaze_logger_armed
+        _control1_gaze_logger_armed = True
         _sync_gaze_logging()
         print(
-            "eye_legacy logger started mode=gaze "
-            f"interval_ignored={interval} "
+            "control1_gaze_logger started mode=gaze "
             f"enabled={actions.tracking.control1_enabled()}"
         )
 
     @staticmethod
-    def eye_legacy_log_stop() -> None:
-        """Disable legacy eye logger."""
-        global _eye_legacy_log_armed
-        _eye_legacy_log_armed = False
+    def control1_gaze_logger_stop() -> None:
+        """Disable control1 gaze logger."""
+        global _control1_gaze_logger_armed
+        _control1_gaze_logger_armed = False
         _unregister_gaze()
-        print("eye_legacy logger stopped")
+        print("control1_gaze_logger stopped")
 
     @staticmethod
-    def eye_legacy_log_once() -> None:
-        """Log one legacy eye tracking sample."""
-        print(_legacy_sample_line())
+    def control1_gaze_logger_once() -> None:
+        """Log one control1 eye tracking sample."""
+        print(_control1_sample_line())
 
     @staticmethod
-    def eye_legacy_log_running() -> bool:
-        """Return whether legacy eye logger is actively receiving gaze events."""
-        return _eye_legacy_gaze_registered
+    def control1_gaze_logger_running() -> bool:
+        """Return whether control1 gaze logger is actively receiving gaze events."""
+        return _control1_gaze_subscribed
 
 
 def _on_ready() -> None:
