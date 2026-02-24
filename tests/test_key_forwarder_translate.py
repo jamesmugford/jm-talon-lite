@@ -11,7 +11,7 @@ class DotoolTranslateTests(unittest.TestCase):
             sys.path.insert(0, str(apps_dir))
             added = True
         try:
-            from key_forwarding import dotool_translate
+            from key_forwarder import dotool_translate
 
             cls.translate = dotool_translate
         finally:

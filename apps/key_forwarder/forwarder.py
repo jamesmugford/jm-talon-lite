@@ -1,4 +1,4 @@
-"""Global Talon key forwarding via dotool."""
+"""Global Talon key forwarder via dotool."""
 
 from talon import Context, Module, actions, settings
 import subprocess
@@ -12,7 +12,7 @@ from .dotool_translate import (
 
 mod = Module()
 mod.setting(
-    "key_forwarding_enabled",
+    "key_forwarder_enabled",
     type=bool,
     default=False,
     desc="Forward Talon key() through external backend (global).",
@@ -30,7 +30,7 @@ class MainActions:
         Args:
             key: Talon key spec string.
         """
-        if not settings.get("user.key_forwarding_enabled"):
+        if not settings.get("user.key_forwarder_enabled"):
             actions.next(key)
             return
         print(f"dotool key: {key!r}", file=sys.stderr, flush=True)
