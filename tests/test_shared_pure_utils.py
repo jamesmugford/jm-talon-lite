@@ -24,6 +24,14 @@ class SharedPureUtilsTests(unittest.TestCase):
         self.assertTrue(self.core.should_emit_state_change(False, True))
         self.assertTrue(self.core.should_emit_state_change(True, False))
 
+    def test_resolve_toggle_state(self):
+        self.assertTrue(self.core.resolve_toggle_state(False, None))
+        self.assertFalse(self.core.resolve_toggle_state(True, None))
+        self.assertTrue(self.core.resolve_toggle_state(False, True))
+        self.assertFalse(self.core.resolve_toggle_state(True, False))
+        self.assertTrue(self.core.resolve_toggle_state(False, 1))
+        self.assertFalse(self.core.resolve_toggle_state(True, 0))
+
     def test_desktop_bounds_empty_defaults(self):
         self.assertEqual(
             self.core.desktop_bounds_from_rects([]),

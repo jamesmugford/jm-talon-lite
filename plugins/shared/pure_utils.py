@@ -13,6 +13,13 @@ def should_emit_state_change(before: bool, after: bool) -> bool:
     return before != after
 
 
+def resolve_toggle_state(current: bool, requested) -> bool:
+    """Return next toggle state from current state and optional target."""
+    if requested is None:
+        return not current
+    return bool(requested)
+
+
 def desktop_bounds_from_rects(rects: list[RectTuple]) -> Bounds:
     """Return union desktop bounds as left, top, width, height."""
     if not rects:

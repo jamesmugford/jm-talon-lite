@@ -11,3 +11,6 @@ settings():
 
     # Auto-start control1 gaze logger on Talon startup
     user.control1_gaze_logger_autostart = 0
+
+    # Enable hiss mouse behavior on Talon startup
+    user.hiss_mouse_autostart = 1
