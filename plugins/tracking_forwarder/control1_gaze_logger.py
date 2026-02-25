@@ -1,7 +1,7 @@
 from talon import Module, actions, app, settings, tracking_system
 from talon.plugins import eye_mouse
 
-from .core import format_control1_sample
+from ..shared.pure_utils import format_control1_sample
 
 mod = Module()
 

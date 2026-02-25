@@ -2,7 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 
-class TrackingForwarderCoreTests(unittest.TestCase):
+class SharedPureUtilsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         plugins_dir = Path(__file__).resolve().parents[1] / "plugins"
@@ -11,9 +11,9 @@ class TrackingForwarderCoreTests(unittest.TestCase):
             sys.path.insert(0, str(plugins_dir))
             added = True
         try:
-            from tracking_forwarder import core
+            from shared import pure_utils
 
-            cls.core = core
+            cls.core = pure_utils
         finally:
             if added:
                 sys.path.remove(str(plugins_dir))

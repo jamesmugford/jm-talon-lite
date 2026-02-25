@@ -3,7 +3,7 @@ import subprocess
 from talon import Module, actions, app, settings, tracking_system, ui
 from talon.plugins import eye_mouse
 
-from .core import desktop_bounds_from_rects, normalize_point
+from ..shared.pure_utils import desktop_bounds_from_rects, normalize_point
 
 mod = Module()
 
@@ -20,7 +20,7 @@ mod.setting(
     desc="Log when control1 pointer forwarder auto-starts.",
 )
 
-_dotool_proc = None
+_dotoolc_proc = None
 _desktop_bounds = (0.0, 0.0, 1.0, 1.0)
 
 
@@ -33,13 +33,13 @@ def _refresh_desktop_bounds() -> None:
     _desktop_bounds = desktop_bounds_from_rects(rects)
 
 
-def _close_dotool_proc() -> None:
-    global _dotool_proc
-    if _dotool_proc is None:
+def _close_dotoolc_proc() -> None:
+    global _dotoolc_proc
+    if _dotoolc_proc is None:
         return
 
-    proc = _dotool_proc
-    _dotool_proc = None
+    proc = _dotoolc_proc
+    _dotoolc_proc = None
 
     try:
         if proc.stdin is not None:
@@ -60,54 +60,54 @@ def _close_dotool_proc() -> None:
         pass
 
 
-def _ensure_dotool_proc() -> bool:
-    global _dotool_proc
-    if _dotool_proc is not None and _dotool_proc.poll() is None and _dotool_proc.stdin:
+def _ensure_dotoolc_proc() -> bool:
+    global _dotoolc_proc
+    if _dotoolc_proc is not None and _dotoolc_proc.poll() is None and _dotoolc_proc.stdin:
         return True
 
-    _close_dotool_proc()
+    _close_dotoolc_proc()
     try:
-        _dotool_proc = subprocess.Popen(
+        _dotoolc_proc = subprocess.Popen(
             ["dotoolc"],
             stdin=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
     except Exception as exc:
-        print(f"control1 pointer forwarder dotoolc error: {exc}")
-        _dotool_proc = None
+        print(f"control1_pointer_forwarder dotoolc error: {exc}")
+        _dotoolc_proc = None
         return False
 
-    if _dotool_proc.stdin is None:
-        _close_dotool_proc()
+    if _dotoolc_proc.stdin is None:
+        _close_dotoolc_proc()
         return False
     return True
 
 
 def _send_dotool_line(line: str) -> None:
-    if not _ensure_dotool_proc():
+    if not _ensure_dotoolc_proc():
         return
 
-    assert _dotool_proc is not None
-    assert _dotool_proc.stdin is not None
+    assert _dotoolc_proc is not None
+    assert _dotoolc_proc.stdin is not None
     try:
-        _dotool_proc.stdin.write(f"{line}\n")
-        _dotool_proc.stdin.flush()
+        _dotoolc_proc.stdin.write(f"{line}\n")
+        _dotoolc_proc.stdin.flush()
         return
     except Exception:
-        _close_dotool_proc()
+        _close_dotoolc_proc()
 
-    if not _ensure_dotool_proc():
+    if not _ensure_dotoolc_proc():
         return
 
-    assert _dotool_proc is not None
-    assert _dotool_proc.stdin is not None
+    assert _dotoolc_proc is not None
+    assert _dotoolc_proc.stdin is not None
     try:
-        _dotool_proc.stdin.write(f"{line}\n")
-        _dotool_proc.stdin.flush()
+        _dotoolc_proc.stdin.write(f"{line}\n")
+        _dotoolc_proc.stdin.flush()
     except Exception as exc:
-        print(f"control1 pointer forwarder write error: {exc}")
-        _close_dotool_proc()
+        print(f"control1_pointer_forwarder write error: {exc}")
+        _close_dotoolc_proc()
 
 
 def _clear_gaze_subscriptions() -> None:
@@ -126,7 +126,7 @@ def _unregister_gaze() -> None:
 
 def _on_gaze(*_args) -> None:
     if not actions.tracking.control1_enabled():
-        _close_dotool_proc()
+        _close_dotoolc_proc()
         return
 
     hist = eye_mouse.mouse.xy_hist
@@ -150,7 +150,7 @@ class Actions:
         _refresh_desktop_bounds()
         _register_gaze()
         print(
-            "control1 pointer forwarder started "
+            "control1_pointer_forwarder started "
             f"enabled={actions.tracking.control1_enabled()}"
         )
 
@@ -158,8 +158,8 @@ class Actions:
     def control1_pointer_forwarder_stop() -> None:
         """Stop control1 pointer forwarding."""
         _unregister_gaze()
-        _close_dotool_proc()
-        print("control1 pointer forwarder stopped")
+        _close_dotoolc_proc()
+        print("control1_pointer_forwarder stopped")
 
     @staticmethod
     def control1_pointer_forwarder_toggle(state: bool | None = None) -> None:
@@ -178,7 +178,7 @@ def _on_ready() -> None:
         actions.user.control1_pointer_forwarder_start()
         if settings.get("user.control1_pointer_forwarder_autostart_log"):
             print(
-                "control1 pointer forwarder autostarted "
+                "control1_pointer_forwarder autostarted "
                 f"enabled={actions.tracking.control1_enabled()}"
             )
         return

@@ -11,7 +11,7 @@ def _dotool_click_payload(button: str) -> str:
     return f"click {button}\n"
 
 
-def _dotool_left_click() -> None:
+def _forward_left_click() -> None:
     try:
         subprocess.run(
             ["dotoolc"],
@@ -35,4 +35,4 @@ class UserActions:
 
     @staticmethod
     def noise_trigger_pop():
-        _dotool_left_click()
+        _forward_left_click()

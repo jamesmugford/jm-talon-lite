@@ -1,7 +1,7 @@
 from talon import Context, Module, actions, app
 from talon.plugins import eye_mouse_2
 
-from .core import should_emit_state_change
+from ..shared.pure_utils import should_emit_state_change
 
 ctx = Context()
 mod = Module()
@@ -81,14 +81,14 @@ class Actions:
         """Enable control1 state events (event-driven, no poll loop)."""
         hooked = _install_menu_hook()
         print(
-            f"control1 state events started mode=events "
+            f"control1_state_events started mode=events "
             f"hooked={hooked}"
         )
 
     @staticmethod
     def control1_state_events_stop() -> None:
         """No-op: state events are always on once loaded."""
-        print("control1 state events stopped (no-op in event mode)")
+        print("control1_state_events stopped (no-op in event mode)")
 
     @staticmethod
     def control1_state_events_running() -> bool:

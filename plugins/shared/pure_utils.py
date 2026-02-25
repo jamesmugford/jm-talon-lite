@@ -1,4 +1,4 @@
-"""Pure helpers for tracking forwarders."""
+"""Pure helpers shared across forwarder plugins."""
 
 from __future__ import annotations
 

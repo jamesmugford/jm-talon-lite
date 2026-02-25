@@ -2,7 +2,7 @@ from talon import Context, Module, actions, app, tracking_system, ui
 from talon.canvas import Canvas
 from talon.plugins import eye_mouse
 
-from .core import rect_local_point
+from ..shared.pure_utils import rect_local_point
 
 ctx = Context()
 mod = Module()
@@ -142,24 +142,24 @@ class Actions:
         """Start control1 debug overlay."""
         global _overlay_enabled
         if _overlay_enabled:
-            print("control1 debug overlay already running")
+            print("control1_debug_overlay already running")
             return
         _overlay_enabled = True
         _create_canvases()
         _sync_overlay()
-        print("control1 debug overlay started")
+        print("control1_debug_overlay started")
 
     @staticmethod
     def control1_debug_overlay_stop() -> None:
         """Stop control1 debug overlay."""
         global _overlay_enabled
         if not _overlay_enabled:
-            print("control1 debug overlay stopped")
+            print("control1_debug_overlay stopped")
             return
         _overlay_enabled = False
         _unregister_gaze()
         _close_canvases()
-        print("control1 debug overlay stopped")
+        print("control1_debug_overlay stopped")
 
     @staticmethod
     def control1_debug_overlay_toggle(state: bool | None = None) -> None:

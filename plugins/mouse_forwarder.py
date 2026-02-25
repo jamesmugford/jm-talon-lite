@@ -4,7 +4,7 @@ import sys
 
 from talon import Context, Module, actions, app, ui
 
-from .tracking_forwarder.core import desktop_bounds_from_rects, normalize_point
+from .shared.pure_utils import desktop_bounds_from_rects, normalize_point
 
 mod = Module()
 mod.tag(
@@ -17,8 +17,8 @@ ctx.matches = r"""
 os: linux
 """
 
-_dotool_proc = None
-_buttons_down: set[int] = set()
+_dotoolc_proc = None
+_pressed_buttons: set[int] = set()
 
 
 def _is_wayland() -> bool:
@@ -39,13 +39,13 @@ def _button_name(button: int) -> str | None:
     return None
 
 
-def _close_dotool_proc() -> None:
-    global _dotool_proc
-    if _dotool_proc is None:
+def _close_dotoolc_proc() -> None:
+    global _dotoolc_proc
+    if _dotoolc_proc is None:
         return
 
-    proc = _dotool_proc
-    _dotool_proc = None
+    proc = _dotoolc_proc
+    _dotoolc_proc = None
 
     try:
         if proc.stdin is not None:
@@ -66,62 +66,62 @@ def _close_dotool_proc() -> None:
         pass
 
 
-def _ensure_dotool_proc() -> bool:
-    global _dotool_proc
-    if _dotool_proc is not None and _dotool_proc.poll() is None and _dotool_proc.stdin:
+def _ensure_dotoolc_proc() -> bool:
+    global _dotoolc_proc
+    if _dotoolc_proc is not None and _dotoolc_proc.poll() is None and _dotoolc_proc.stdin:
         return True
 
-    _close_dotool_proc()
+    _close_dotoolc_proc()
     try:
-        _dotool_proc = subprocess.Popen(
+        _dotoolc_proc = subprocess.Popen(
             ["dotoolc"],
             stdin=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
     except Exception as exc:
-        print(f"mouse forwarder dotoolc error: {exc}", file=sys.stderr, flush=True)
-        _dotool_proc = None
+        print(f"mouse_forwarder dotoolc error: {exc}", file=sys.stderr, flush=True)
+        _dotoolc_proc = None
         return False
 
-    if _dotool_proc.stdin is None:
-        _close_dotool_proc()
+    if _dotoolc_proc.stdin is None:
+        _close_dotoolc_proc()
         return False
     return True
 
 
 def _send_dotool_line(line: str) -> None:
-    if not _ensure_dotool_proc():
+    if not _ensure_dotoolc_proc():
         return
 
-    assert _dotool_proc is not None
-    assert _dotool_proc.stdin is not None
+    assert _dotoolc_proc is not None
+    assert _dotoolc_proc.stdin is not None
     try:
-        _dotool_proc.stdin.write(f"{line}\n")
-        _dotool_proc.stdin.flush()
+        _dotoolc_proc.stdin.write(f"{line}\n")
+        _dotoolc_proc.stdin.flush()
         return
     except Exception:
-        _close_dotool_proc()
+        _close_dotoolc_proc()
 
-    if not _ensure_dotool_proc():
+    if not _ensure_dotoolc_proc():
         return
 
-    assert _dotool_proc is not None
-    assert _dotool_proc.stdin is not None
+    assert _dotoolc_proc is not None
+    assert _dotoolc_proc.stdin is not None
     try:
-        _dotool_proc.stdin.write(f"{line}\n")
-        _dotool_proc.stdin.flush()
+        _dotoolc_proc.stdin.write(f"{line}\n")
+        _dotoolc_proc.stdin.flush()
     except Exception as exc:
-        print(f"mouse forwarder write error: {exc}", file=sys.stderr, flush=True)
-        _close_dotool_proc()
+        print(f"mouse_forwarder write error: {exc}", file=sys.stderr, flush=True)
+        _close_dotoolc_proc()
 
 
 def _release_all_buttons() -> bool:
-    had_buttons = bool(_buttons_down)
+    had_buttons = bool(_pressed_buttons)
     _send_dotool_line("buttonup left")
     _send_dotool_line("buttonup right")
     _send_dotool_line("buttonup middle")
-    _buttons_down.clear()
+    _pressed_buttons.clear()
     return had_buttons
 
 
@@ -150,7 +150,7 @@ class MainActions:
             actions.next(button)
             return
         _send_dotool_line(f"buttondown {button_name}")
-        _buttons_down.add(button)
+        _pressed_buttons.add(button)
 
     @staticmethod
     def mouse_release(button: int = 0):
@@ -163,7 +163,7 @@ class MainActions:
             actions.next(button)
             return
         _send_dotool_line(f"buttonup {button_name}")
-        _buttons_down.discard(button)
+        _pressed_buttons.discard(button)
 
     @staticmethod
     def mouse_move(x: float, y: float):
@@ -194,7 +194,7 @@ class UserActions:
             actions.next(button)
             return
 
-        if button in _buttons_down:
+        if button in _pressed_buttons:
             actions.mouse_release(button)
             return
         actions.mouse_drag(button)
