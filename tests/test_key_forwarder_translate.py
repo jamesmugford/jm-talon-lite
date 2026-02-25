@@ -5,10 +5,10 @@ from pathlib import Path
 class DotoolTranslateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        apps_dir = Path(__file__).resolve().parents[1] / "apps"
+        plugins_dir = Path(__file__).resolve().parents[1] / "plugins"
         added = False
-        if str(apps_dir) not in sys.path:
-            sys.path.insert(0, str(apps_dir))
+        if str(plugins_dir) not in sys.path:
+            sys.path.insert(0, str(plugins_dir))
             added = True
         try:
             from key_forwarder import dotool_translate
@@ -16,7 +16,7 @@ class DotoolTranslateTests(unittest.TestCase):
             cls.translate = dotool_translate
         finally:
             if added:
-                sys.path.remove(str(apps_dir))
+                sys.path.remove(str(plugins_dir))
 
     def test_dotool_actions_to_input(self):
         self.assertEqual(self.translate.dotool_actions_to_input([]), "")

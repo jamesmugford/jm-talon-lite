@@ -78,7 +78,7 @@ class Actions:
 
     @staticmethod
     def control1_state_events_start() -> None:
-        """Enable control1 state events (event-driven, no polling)."""
+        """Enable control1 state events (event-driven, no poll loop)."""
         hooked = _install_menu_hook()
         print(
             f"control1 state events started mode=events "

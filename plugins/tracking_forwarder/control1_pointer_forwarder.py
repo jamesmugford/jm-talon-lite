@@ -11,7 +11,7 @@ mod.setting(
     "control1_pointer_forwarder_autostart",
     type=bool,
     default=False,
-    desc="Auto-start control1 pointer forwarder on Talon startup.",
+    desc="Auto-start control1 pointer forwarder at Talon startup.",
 )
 mod.setting(
     "control1_pointer_forwarder_autostart_log",

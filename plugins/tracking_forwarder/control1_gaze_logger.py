@@ -9,7 +9,7 @@ mod.setting(
     "control1_gaze_logger_autostart",
     type=bool,
     default=False,
-    desc="Auto-start control1 gaze logger on Talon startup.",
+    desc="Auto-start control1 gaze logger at Talon startup.",
 )
 
 def _control1_sample_line() -> str:

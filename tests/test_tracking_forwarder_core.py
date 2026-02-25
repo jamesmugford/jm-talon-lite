@@ -5,10 +5,10 @@ from pathlib import Path
 class TrackingForwarderCoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        apps_dir = Path(__file__).resolve().parents[1] / "apps"
+        plugins_dir = Path(__file__).resolve().parents[1] / "plugins"
         added = False
-        if str(apps_dir) not in sys.path:
-            sys.path.insert(0, str(apps_dir))
+        if str(plugins_dir) not in sys.path:
+            sys.path.insert(0, str(plugins_dir))
             added = True
         try:
             from tracking_forwarder import core
@@ -16,7 +16,7 @@ class TrackingForwarderCoreTests(unittest.TestCase):
             cls.core = core
         finally:
             if added:
-                sys.path.remove(str(apps_dir))
+                sys.path.remove(str(plugins_dir))
 
     def test_should_emit_state_change(self):
         self.assertFalse(self.core.should_emit_state_change(False, False))
