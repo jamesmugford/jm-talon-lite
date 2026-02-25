@@ -1,11 +1,13 @@
 # Talon Lite
 
-A lightweight shim to forward Talon input to Wayland backends.
+A lightweight shim to forward Talon input to Wayland backends. 
 
-This is a drop in config, that you can drop in alongside the community or any other custom config.
+This is a drop in config, that you can drop in alongside the community or any other custom config. 
 
 This takes a progressive enhancement approach to adding features, minimally adding features that are possible to
 add without writing compositor specific code.
+
+It is entirely event driven, so it will introduce virtually no latency.
 
 Current features
 ===
