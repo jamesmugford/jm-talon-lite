@@ -20,6 +20,13 @@ def resolve_toggle_state(current: bool, requested) -> bool:
     return bool(requested)
 
 
+def accumulate_scroll_steps(delta: float, remainder: float) -> tuple[int, float]:
+    """Convert a fractional scroll delta to whole steps and next remainder."""
+    total = delta + remainder
+    steps = int(total)
+    return steps, total - steps
+
+
 def desktop_bounds_from_rects(rects: list[RectTuple]) -> Bounds:
     """Return union desktop bounds as left, top, width, height."""
     if not rects:

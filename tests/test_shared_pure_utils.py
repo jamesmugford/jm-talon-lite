@@ -32,6 +32,23 @@ class SharedPureUtilsTests(unittest.TestCase):
         self.assertTrue(self.core.resolve_toggle_state(False, 1))
         self.assertFalse(self.core.resolve_toggle_state(True, 0))
 
+    def test_accumulate_scroll_steps(self):
+        steps, remainder = self.core.accumulate_scroll_steps(0.4, 0.0)
+        self.assertEqual(steps, 0)
+        self.assertAlmostEqual(remainder, 0.4)
+
+        steps, remainder = self.core.accumulate_scroll_steps(0.7, remainder)
+        self.assertEqual(steps, 1)
+        self.assertAlmostEqual(remainder, 0.1)
+
+        steps, remainder = self.core.accumulate_scroll_steps(-0.6, remainder)
+        self.assertEqual(steps, 0)
+        self.assertAlmostEqual(remainder, -0.5)
+
+        steps, remainder = self.core.accumulate_scroll_steps(-0.7, remainder)
+        self.assertEqual(steps, -1)
+        self.assertAlmostEqual(remainder, -0.2)
+
     def test_desktop_bounds_empty_defaults(self):
         self.assertEqual(
             self.core.desktop_bounds_from_rects([]),

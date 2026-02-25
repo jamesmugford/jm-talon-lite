@@ -2,9 +2,13 @@ import os
 import subprocess
 import sys
 
-from talon import Context, Module, actions, app, ui
+from talon import Context, Module, actions, app, settings, ui
 
-from .shared.pure_utils import desktop_bounds_from_rects, normalize_point
+from .shared.pure_utils import (
+    accumulate_scroll_steps,
+    desktop_bounds_from_rects,
+    normalize_point,
+)
 
 mod = Module()
 mod.tag(
@@ -17,8 +21,30 @@ ctx.matches = r"""
 os: linux
 """
 
+
+@mod.action_class
+class Actions:
+    @staticmethod
+    def mouse_forwarder_scroll_up(amount: float = 1):
+        """Scroll up via Wayland mouse forwarder."""
+
+    @staticmethod
+    def mouse_forwarder_scroll_down(amount: float = 1):
+        """Scroll down via Wayland mouse forwarder."""
+
+    @staticmethod
+    def mouse_forwarder_scroll_left(amount: float = 1):
+        """Scroll left via Wayland mouse forwarder."""
+
+    @staticmethod
+    def mouse_forwarder_scroll_right(amount: float = 1):
+        """Scroll right via Wayland mouse forwarder."""
+
+
 _dotoolc_proc = None
 _pressed_buttons: set[int] = set()
+_vertical_scroll_remainder = 0.0
+_horizontal_scroll_remainder = 0.0
 
 
 def _is_wayland() -> bool:
@@ -125,6 +151,43 @@ def _release_all_buttons() -> bool:
     return had_buttons
 
 
+def _scaled_scroll_delta(delta: float, setting_name: str) -> float:
+    unit = settings.get(setting_name)
+    if unit == 0:
+        return delta
+    return delta / unit
+
+
+def _forward_vertical_scroll(delta: float) -> None:
+    global _vertical_scroll_remainder
+    if delta == 0:
+        return
+
+    scaled = _scaled_scroll_delta(delta, "user.mouse_wheel_down_amount")
+    steps, _vertical_scroll_remainder = accumulate_scroll_steps(
+        scaled,
+        _vertical_scroll_remainder,
+    )
+    if steps == 0:
+        return
+    _send_dotool_line(f"wheel {-steps}")
+
+
+def _forward_horizontal_scroll(delta: float) -> None:
+    global _horizontal_scroll_remainder
+    if delta == 0:
+        return
+
+    scaled = _scaled_scroll_delta(delta, "user.mouse_wheel_horizontal_amount")
+    steps, _horizontal_scroll_remainder = accumulate_scroll_steps(
+        scaled,
+        _horizontal_scroll_remainder,
+    )
+    if steps == 0:
+        return
+    _send_dotool_line(f"hwheel {steps}")
+
+
 @ctx.action_class("main")
 class MainActions:
     @staticmethod
@@ -179,9 +242,91 @@ class MainActions:
         nx, ny = normalize_point(bounds, x, y)
         _send_dotool_line(f"mouseto {nx:.6f} {ny:.6f}")
 
+    @staticmethod
+    def mouse_scroll(y: float = 0.0, x: float = 0.0, by_lines: bool = False):
+        if not _is_wayland():
+            actions.next(y, x, by_lines)
+            return
+
+        _ = by_lines
+        _forward_vertical_scroll(y)
+        _forward_horizontal_scroll(x)
+
 
 @ctx.action_class("user")
 class UserActions:
+    @staticmethod
+    def mouse_forwarder_scroll_up(amount: float = 1):
+        if not _is_wayland():
+            actions.user.mouse_scroll_up(amount)
+            return
+
+        delta = amount * settings.get("user.mouse_wheel_down_amount")
+        _forward_vertical_scroll(-delta)
+
+    @staticmethod
+    def mouse_forwarder_scroll_down(amount: float = 1):
+        if not _is_wayland():
+            actions.user.mouse_scroll_down(amount)
+            return
+
+        delta = amount * settings.get("user.mouse_wheel_down_amount")
+        _forward_vertical_scroll(delta)
+
+    @staticmethod
+    def mouse_forwarder_scroll_left(amount: float = 1):
+        if not _is_wayland():
+            actions.user.mouse_scroll_left(amount)
+            return
+
+        delta = amount * settings.get("user.mouse_wheel_horizontal_amount")
+        _forward_horizontal_scroll(-delta)
+
+    @staticmethod
+    def mouse_forwarder_scroll_right(amount: float = 1):
+        if not _is_wayland():
+            actions.user.mouse_scroll_right(amount)
+            return
+
+        delta = amount * settings.get("user.mouse_wheel_horizontal_amount")
+        _forward_horizontal_scroll(delta)
+
+    @staticmethod
+    def mouse_scroll_up(amount: float = 1):
+        if not _is_wayland():
+            actions.next(amount)
+            return
+
+        delta = amount * settings.get("user.mouse_wheel_down_amount")
+        _forward_vertical_scroll(-delta)
+
+    @staticmethod
+    def mouse_scroll_down(amount: float = 1):
+        if not _is_wayland():
+            actions.next(amount)
+            return
+
+        delta = amount * settings.get("user.mouse_wheel_down_amount")
+        _forward_vertical_scroll(delta)
+
+    @staticmethod
+    def mouse_scroll_left(amount: float = 1):
+        if not _is_wayland():
+            actions.next(amount)
+            return
+
+        delta = amount * settings.get("user.mouse_wheel_horizontal_amount")
+        _forward_horizontal_scroll(-delta)
+
+    @staticmethod
+    def mouse_scroll_right(amount: float = 1):
+        if not _is_wayland():
+            actions.next(amount)
+            return
+
+        delta = amount * settings.get("user.mouse_wheel_horizontal_amount")
+        _forward_horizontal_scroll(delta)
+
     @staticmethod
     def mouse_drag_end() -> bool:
         if not _is_wayland():
@@ -208,3 +353,4 @@ def _on_ready() -> None:
 
 
 app.register("ready", _on_ready)
+_on_ready()
