@@ -7,22 +7,17 @@ This is a drop in config, that you can drop in alongside the community or any ot
 This takes a progressive enhancement approach to adding features, minimally adding features that are possible to
 add without writing compositor specific code.
 
-Who is this for?
+Current features
 ===
-In its current state, this is sufficient for the window manager uber nerds comfortable with:
-
-* Tiling/scrolling WM
-* Vim/Emacs key bindings all the things
-* Use Keyboard friendly app selections.
-* TUIs
-* WIP: Optional eye tracking (for say design applications)
+* Raw keyboard input
+* Eye tracking input: Control Mouse (Legacy) fully supported. (Includes custom "Hiss Mouse" mouse mode)
+* Mouse button commands input. (Touch, Righty, Drag, Wheel Up etc) *Beta: Scrolling support* 
 
 
 Please note
 ===
 **This may not be the Talon you know and love**. If you are used to running Talon under a Linux X11, Mac or Windows
-environment - this will be break a significant number of the features you are used to. This only provides an input
-layer for Talon to provide raw input to Wayland based compositors.
+environment - this will be break a significant number of the features you are used to.
 
 Current supported back ends
 ===
@@ -48,4 +43,17 @@ Run minimal pure-function tests:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
+```
+
+
+Physical keyboard input recipes
+===
+Niri: use F2 to toggle Talon's speech
+
+```
+```
+F2 repeat=false allow-inhibiting=false hotkey-overlay-title="Talon Toggle Listen" {
+    spawn-sh "printf 'from talon import actions; actions.speech.toggle()\\n' | \"$HOME/.talon/bin/repl\" >/dev/null";
+}
+```
 ```
