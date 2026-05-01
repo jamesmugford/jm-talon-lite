@@ -65,4 +65,4 @@ F2 repeat=false allow-inhibiting=false hotkey-overlay-title="Talon Toggle Listen
 
 Other projects
 ===
-Alternative to this project: [Numen Voice](https://numenvoice.org/). It's open source, Wayland friendly and has a very friendly community.
+Alternative to this project: [Numen Voice](https://numenvoice.org/). It's open source, Wayland friendly and has a very friendly community
