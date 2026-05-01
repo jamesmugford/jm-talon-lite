@@ -62,3 +62,7 @@ F2 repeat=false allow-inhibiting=false hotkey-overlay-title="Talon Toggle Listen
     spawn-sh "printf 'from talon import actions; actions.speech.toggle()\\n' | \"$HOME/.talon/bin/repl\" >/dev/null";
 }
 ```
+
+Other projects
+===
+Alternative to this project: [Numen Voice](https://numenvoice.org/). It's open source, Wayland friendly and has a very friendly community.

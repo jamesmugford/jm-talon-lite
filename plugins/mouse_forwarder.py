@@ -4,6 +4,7 @@ import sys
 
 from talon import Context, Module, actions, app, settings, ui
 
+from .key_forwarder.dotool_translate import talon_key_to_dotool_actions
 from .shared.pure_utils import (
     accumulate_scroll_steps,
     desktop_bounds_from_rects,
@@ -39,6 +40,10 @@ class Actions:
     @staticmethod
     def mouse_forwarder_scroll_right(amount: float = 1):
         """Scroll right via Wayland mouse forwarder."""
+
+    @staticmethod
+    def mouse_forwarder_modified_click(modifiers: str, button: int = 0):
+        """Click while holding modifiers via Wayland mouse forwarder."""
 
 
 _dotoolc_proc = None
@@ -116,14 +121,19 @@ def _ensure_dotoolc_proc() -> bool:
     return True
 
 
-def _send_dotool_line(line: str) -> None:
+def _send_dotool_lines(lines: list[str]) -> None:
+    if not lines:
+        return
+
     if not _ensure_dotoolc_proc():
         return
+
+    payload = "".join(f"{line}\n" for line in lines)
 
     assert _dotoolc_proc is not None
     assert _dotoolc_proc.stdin is not None
     try:
-        _dotoolc_proc.stdin.write(f"{line}\n")
+        _dotoolc_proc.stdin.write(payload)
         _dotoolc_proc.stdin.flush()
         return
     except Exception:
@@ -135,11 +145,23 @@ def _send_dotool_line(line: str) -> None:
     assert _dotoolc_proc is not None
     assert _dotoolc_proc.stdin is not None
     try:
-        _dotoolc_proc.stdin.write(f"{line}\n")
+        _dotoolc_proc.stdin.write(payload)
         _dotoolc_proc.stdin.flush()
     except Exception as exc:
         print(f"mouse_forwarder write error: {exc}", file=sys.stderr, flush=True)
         _close_dotoolc_proc()
+
+
+def _send_dotool_line(line: str) -> None:
+    _send_dotool_lines([line])
+
+
+def _modified_click_lines(modifiers: str, button_name: str) -> list[str]:
+    return [
+        *talon_key_to_dotool_actions(f"{modifiers}:down"),
+        f"click {button_name}",
+        *talon_key_to_dotool_actions(f"{modifiers}:up"),
+    ]
 
 
 def _release_all_buttons() -> bool:
@@ -290,6 +312,20 @@ class UserActions:
 
         delta = amount * settings.get("user.mouse_wheel_horizontal_amount")
         _forward_horizontal_scroll(delta)
+
+    @staticmethod
+    def mouse_forwarder_modified_click(modifiers: str, button: int = 0):
+        if not _is_wayland():
+            actions.key(f"{modifiers}:down")
+            actions.mouse_click(button)
+            actions.key(f"{modifiers}:up")
+            return
+
+        button_name = _button_name(button)
+        if button_name is None:
+            actions.mouse_click(button)
+            return
+        _send_dotool_lines(_modified_click_lines(modifiers, button_name))
 
     @staticmethod
     def mouse_scroll_up(amount: float = 1):

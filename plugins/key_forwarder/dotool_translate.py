@@ -13,7 +13,12 @@ from dataclasses import dataclass
 import re
 from typing import Callable
 
-from .dotool_keymap import KEY_NAME_MAP, MODIFIER_ALIASES, SYMBOL_KEY_MAP
+from .dotool_keymap import (
+    KEY_NAME_MAP,
+    MODIFIER_ALIASES,
+    MODIFIER_KEY_NAMES,
+    SYMBOL_KEY_MAP,
+)
 
 KeySpec = str
 DotoolAction = str
@@ -223,12 +228,13 @@ def _mods_only_actions(mods: tuple[str, ...], action: str) -> DotoolActions:
     """
     if not mods:
         return []
+    keys = tuple(MODIFIER_KEY_NAMES.get(mod, mod) for mod in mods)
     if action == "keydown":
-        return [f"keydown {mod}" for mod in mods]
+        return [f"keydown {key}" for key in keys]
     if action == "keyup":
-        return [f"keyup {mod}" for mod in reversed(mods)]
-    actions = [f"keydown {mod}" for mod in mods]
-    actions.extend(f"keyup {mod}" for mod in reversed(mods))
+        return [f"keyup {key}" for key in reversed(keys)]
+    actions = [f"keydown {key}" for key in keys]
+    actions.extend(f"keyup {key}" for key in reversed(keys))
     return actions
 
 

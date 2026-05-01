@@ -7,14 +7,10 @@ righty: mouse_click(1)
 mid click: mouse_click(2)
 
 <user.modifiers> touch:
-    key("{modifiers}:down")
-    mouse_click(0)
-    key("{modifiers}:up")
+    user.mouse_forwarder_modified_click(modifiers, 0)
 
 <user.modifiers> righty:
-    key("{modifiers}:down")
-    mouse_click(1)
-    key("{modifiers}:up")
+    user.mouse_forwarder_modified_click(modifiers, 1)
 
 (dub click | duke):
     mouse_click(0)

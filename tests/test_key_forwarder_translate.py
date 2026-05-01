@@ -32,7 +32,11 @@ class DotoolTranslateTests(unittest.TestCase):
         )
         self.assertEqual(
             self.translate.talon_key_to_dotool_actions("ctrl:down ctrl-a ctrl:up"),
-            ["keydown ctrl", "key ctrl+a", "keyup ctrl"],
+            ["keydown leftctrl", "key ctrl+a", "keyup leftctrl"],
+        )
+        self.assertEqual(
+            self.translate.talon_key_to_dotool_actions("shift:down shift:up"),
+            ["keydown leftshift", "keyup leftshift"],
         )
 
     def test_translate_repeat_suffix(self):

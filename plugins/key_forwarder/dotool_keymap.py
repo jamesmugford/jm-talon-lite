@@ -19,6 +19,14 @@ MODIFIER_ALIASES = {
     "rwin": "super",
 }
 
+MODIFIER_KEY_NAMES = {
+    "ctrl": "leftctrl",
+    "alt": "leftalt",
+    "shift": "leftshift",
+    "super": "leftmeta",
+    "altgr": "rightalt",
+}
+
 KEY_NAME_MAP = {
     "escape": "esc",
     "esc": "esc",
