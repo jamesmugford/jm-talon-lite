@@ -1,4 +1,6 @@
 -
+clear left: key(backspace)
+
 tab (open | new): key(ctrl-t)
 
 tab next: key(ctrl-pagedown)
