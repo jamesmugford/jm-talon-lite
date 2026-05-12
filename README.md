@@ -44,6 +44,17 @@ Install Wayland compatible input backend:
 
 dotoold will need to be run in the background, which can be started with e.g. systemd.
 
+> **Arch users:** Talon's Tobii udev rules use the `plugdev` group, which may not exist by default.
+> If Talon detects your Tobii tracker but fails to open it with `EyeOpenErr: Eye Tracker open failed`,
+> create the group and add your user to it:
+>
+> ```sh
+> sudo groupadd -f plugdev
+> sudo usermod -aG plugdev "$USER"
+> ```
+>
+> Reboot afterward so your session and Talon inherit the new group membership, then reconnect the tracker.
+
 ## Dev tests
 
 Run minimal pure-function tests:
@@ -65,4 +76,4 @@ F2 repeat=false allow-inhibiting=false hotkey-overlay-title="Talon Toggle Listen
 
 Other projects
 ===
-Alternative to this project: [Numen Voice](https://numenvoice.org/). It's open source, Wayland friendly and has a very friendly community
+This project was inspired by: [Numen Voice](https://numenvoice.org/). It's open source, Wayland friendly and has a very friendly community
