@@ -84,14 +84,19 @@ def _ensure_dotoolc_proc() -> bool:
     return True
 
 
-def _send_dotool_line(line: str) -> None:
+def _send_dotool_lines(lines: list[str]) -> None:
+    if not lines:
+        return
+
     if not _ensure_dotoolc_proc():
         return
+
+    payload = "".join(f"{line}\n" for line in lines)
 
     assert _dotoolc_proc is not None
     assert _dotoolc_proc.stdin is not None
     try:
-        _dotoolc_proc.stdin.write(f"{line}\n")
+        _dotoolc_proc.stdin.write(payload)
         _dotoolc_proc.stdin.flush()
         return
     except Exception:
@@ -103,11 +108,15 @@ def _send_dotool_line(line: str) -> None:
     assert _dotoolc_proc is not None
     assert _dotoolc_proc.stdin is not None
     try:
-        _dotoolc_proc.stdin.write(f"{line}\n")
+        _dotoolc_proc.stdin.write(payload)
         _dotoolc_proc.stdin.flush()
     except Exception as exc:
         print(f"control1_pointer_forwarder write error: {exc}")
         _close_dotoolc_proc()
+
+
+def _send_dotool_line(line: str) -> None:
+    _send_dotool_lines([line])
 
 
 def _clear_gaze_subscriptions() -> None:
@@ -135,7 +144,14 @@ def _on_gaze(*_args) -> None:
 
     point = hist[-1]
     x, y = normalize_point(_desktop_bounds, point.x, point.y)
-    _send_dotool_line(f"mouseto {x:.6f} {y:.6f}")
+    # TODO: Revisit this Hyprland workaround. Synthetic absolute cursor moves,
+    # including hyprctl dispatch movecursor, move the cursor but do not refresh
+    # hover/focus until Hyprland sees a relative pointer event.
+    _send_dotool_lines([
+        f"mouseto {x:.6f} {y:.6f}",
+        "mousemove 1 0",
+        "mousemove -1 0",
+    ])
 
 
 def _on_screen_change(_screens) -> None:
