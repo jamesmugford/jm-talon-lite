@@ -4,8 +4,8 @@ A lightweight shim to forward Talon input to Wayland backends.
 
 This is a drop in config, that you can drop in alongside the community or any other custom config. 
 
-This takes a progressive enhancement approach to adding features, minimally adding features that are possible to
-add without writing compositor specific code.
+This takes a progressive enhancement approach to adding features, keeping the core features compositor-agnostic
+while allowing optional compositor-specific app layers.
 
 It is entirely event driven, so it will introduce virtually no latency.
 
@@ -14,6 +14,7 @@ Current features
 * Raw keyboard input
 * Eye tracking input: Control Mouse (Legacy) fully supported. (Includes custom "Hiss Mouse" mouse mode)
 * Mouse button commands input. (Touch, Righty, Drag, Wheel Up etc) *Beta: Scrolling support* 
+* Optional Hyprland voice command app layer
 
 Who is this for
 ===
@@ -66,12 +67,18 @@ PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
 
 Physical keyboard input recipes
 ===
-Niri: use F2 to toggle Talon's speech
+Niri: use F8 to toggle Talon's speech
 
 ```
-F2 repeat=false allow-inhibiting=false hotkey-overlay-title="Talon Toggle Listen" {
+F8 repeat=false allow-inhibiting=false hotkey-overlay-title="Talon Toggle Listen" {
     spawn-sh "printf 'from talon import actions; actions.speech.toggle()\\n' | \"$HOME/.talon/bin/repl\" >/dev/null";
 }
+```
+
+Hyprland/Omarchy: add this to `~/.config/hypr/bindings.conf` to use F8 to toggle Talon's speech
+
+```ini
+bind = , F8, exec, sh -c 'printf "%s\n" "from talon import actions; actions.speech.toggle()" | "$HOME/.talon/bin/repl" >/dev/null'
 ```
 
 Other projects
