@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -15,12 +16,6 @@ mod.setting(
     type=bool,
     default=True,
     desc="Automatically enable the Hyprland tag when Talon is running under Hyprland.",
-)
-mod.setting(
-    "hyprland_launcher_command",
-    type=str,
-    default="omarchy-launch-walker",
-    desc="Command Hyprland should run for the app launcher.",
 )
 mod.setting(
     "hyprland_terminal_command",
@@ -62,23 +57,49 @@ def _setting(name: str, default):
         return default
 
 
-def _hyprctl(*args: str) -> None:
+def _run_hyprctl(*args: str) -> subprocess.CompletedProcess[str] | None:
     try:
-        result = subprocess.run(
-            ["hyprctl", "--", *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        return subprocess.run(
+            ["hyprctl", *args],
+            capture_output=True,
             text=True,
             check=False,
             timeout=1,
         )
     except Exception as exc:
         print(f"hyprland hyprctl error: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
+def _hyprctl(*args: str) -> None:
+    result = _run_hyprctl("--", *args)
+    if result is None:
         return
 
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
         print(f"hyprland hyprctl error: {message}", file=sys.stderr, flush=True)
+        return
+
+    output = result.stdout.strip()
+    if output and any(line.strip().lower() != "ok" for line in output.splitlines()):
+        print(f"hyprland hyprctl error: {output}", file=sys.stderr, flush=True)
+
+
+def _hyprctl_json(command: str) -> dict | list | None:
+    result = _run_hyprctl("-j", command)
+    if result is None:
+        return None
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        print(f"hyprland hyprctl error: {message}", file=sys.stderr, flush=True)
+        return None
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"hyprland hyprctl JSON error: {exc}", file=sys.stderr, flush=True)
+        return None
+    return value if isinstance(value, (dict, list)) else None
 
 
 def _dispatch(dispatcher: str, arg: Optional[str] = None) -> None:
@@ -86,6 +107,14 @@ def _dispatch(dispatcher: str, arg: Optional[str] = None) -> None:
         _hyprctl("dispatch", dispatcher)
         return
     _hyprctl("dispatch", dispatcher, arg)
+
+
+def _exec(command: str) -> None:
+    command = command.strip()
+    if not command:
+        app.notify("Hyprland command cannot be empty.")
+        return
+    _dispatch("exec", command)
 
 
 def _direction(value: str) -> str:
@@ -102,6 +131,71 @@ def _workspace_arg(which: Union[str, int]) -> str:
     return str(which)
 
 
+def _launch_scratch_terminal() -> None:
+    command = _setting("user.hyprland_terminal_command", "xdg-terminal-exec").strip()
+    if not command:
+        app.notify("Terminal command cannot be empty.")
+        return
+    _dispatch("exec", f"[workspace special:scratchpad] {command}")
+
+
+def _resolve_window_tiled_layout(window: dict, workspaces: list) -> str | None:
+    """Purely resolve a window's tiled layout from Hyprland metadata.
+
+    Args:
+        window: Metadata from ``hyprctl -j activewindow``.
+        workspaces: Metadata from ``hyprctl -j workspaces``.
+
+    Returns:
+        The tiled layout name, or ``None`` when it cannot be resolved.
+    """
+    window_workspace = window.get("workspace")
+    if not isinstance(window_workspace, dict):
+        return None
+
+    # Match the focused window's workspace, including special workspaces.
+    workspace_id = window_workspace.get("id")
+    for workspace in workspaces:
+        if not isinstance(workspace, dict) or workspace.get("id") != workspace_id:
+            continue
+        layout = workspace.get("tiledLayout")
+        return layout if isinstance(layout, str) else None
+    return None
+
+
+def _resize_active_window_by_pixels(direction: int) -> None:
+    pixels = direction * 100
+    _dispatch("resizeactive", f"{pixels} {pixels}")
+
+
+def _resize_active_window(direction: int) -> None:
+    direction = 1 if direction > 0 else -1
+    window = _hyprctl_json("activewindow")
+
+    if not isinstance(window, dict):
+        _resize_active_window_by_pixels(direction)
+        return
+
+    # Floating windows resize directly, then recenter like Community i3.
+    if window.get("floating", False):
+        _resize_active_window_by_pixels(direction)
+        _dispatch("centerwindow")
+        return
+
+    workspaces = _hyprctl_json("workspaces")
+    if not isinstance(workspaces, list):
+        _resize_active_window_by_pixels(direction)
+        return
+
+    # Scrolling tiles resize by column rather than generic window pixels.
+    if _resolve_window_tiled_layout(window, workspaces) == "scrolling":
+        _dispatch("layoutmsg", f"colresize {direction * 0.1:+g}")
+        return
+
+    # Other tiled layouts use Hyprland's generic pixel resize fallback.
+    _resize_active_window_by_pixels(direction)
+
+
 @ctx.action_class("app")
 class AppActions:
     def window_close():
@@ -111,12 +205,12 @@ class AppActions:
 @mod.action_class
 class Actions:
     def hyprland_dispatch(dispatcher: str, arg: Optional[str] = None):
-        """Run a Hyprland dispatcher."""
+        """Run a legacy Hyprland dispatcher."""
         _dispatch(dispatcher, arg)
 
     def hyprland_exec(command: str):
         """Run a command through Hyprland."""
-        _dispatch("exec", command)
+        _exec(command)
 
     def hyprland_reload():
         """Reload the Hyprland config."""
@@ -151,7 +245,7 @@ class Actions:
         _dispatch("fullscreen", "0")
 
     def hyprland_full_width():
-        """Toggle full-width mode for the active window."""
+        """Toggle maximized mode for the active window."""
         _dispatch("fullscreen", "1")
 
     def hyprland_float():
@@ -170,21 +264,25 @@ class Actions:
         """Preselect where the next dwindle window should open."""
         _dispatch("layoutmsg", f"preselect {_direction(direction)}")
 
-    def hyprland_resize(width_delta: int, height_delta: int):
-        """Resize the active window."""
-        _dispatch("resizeactive", f"{width_delta} {height_delta}")
+    def hyprland_resize_column(delta: float):
+        """Resize the active scrolling-layout column."""
+        _dispatch("layoutmsg", f"colresize {delta:+g}")
 
-    def hyprland_launch():
-        """Launch the configured app launcher."""
-        _dispatch("exec", _setting("user.hyprland_launcher_command", "omarchy-launch-walker"))
+    def hyprland_resize_window(direction: int):
+        """Grow or shrink using behavior appropriate for the active layout."""
+        _resize_active_window(direction)
 
     def hyprland_shell():
         """Launch the configured terminal."""
-        _dispatch("exec", _setting("user.hyprland_terminal_command", "xdg-terminal-exec"))
+        _exec(_setting("user.hyprland_terminal_command", "xdg-terminal-exec"))
 
     def hyprland_lock():
         """Run the configured screen lock command."""
-        _dispatch("exec", _setting("user.hyprland_lock_command", "hyprlock"))
+        _exec(_setting("user.hyprland_lock_command", "hyprlock"))
+
+    def hyprland_new_scratch_terminal():
+        """Launch a terminal directly on the scratchpad workspace."""
+        _launch_scratch_terminal()
 
 
 def _on_ready() -> None:

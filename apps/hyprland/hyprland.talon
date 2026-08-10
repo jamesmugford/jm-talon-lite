@@ -1,4 +1,5 @@
 # Hyprland commands auto-enable when Talon starts under Hyprland.
+# Shared resize forms mirror Talon Community's i3 vocabulary where practical.
 os: linux
 tag: user.hyprland
 -
@@ -22,15 +23,10 @@ full width: user.hyprland_full_width()
 toggle floating: user.hyprland_float()
 center window: user.hyprland_center()
 
-grow window:
-    user.hyprland_resize(100, 100)
-    sleep(100ms)
-    user.hyprland_center()
-
-shrink window:
-    user.hyprland_resize(-100, -100)
-    sleep(100ms)
-    user.hyprland_center()
+grow column: user.hyprland_resize_column(0.1)
+shrink column: user.hyprland_resize_column(-0.1)
+grow window: user.hyprland_resize_window(1)
+shrink window: user.hyprland_resize_window(-1)
 
 horizontal (shell | terminal):
     user.hyprland_preselect("right")
@@ -56,17 +52,8 @@ vertical (shell | terminal):
 make scratch: user.hyprland_move_to_scratchpad()
 [(show | hide)] scratch: user.hyprland_show_scratchpad()
 
-launch: user.hyprland_launch()
-launch <user.text>:
-    user.hyprland_launch()
-    sleep(100ms)
-    insert("{text}")
 lock screen: user.hyprland_lock()
 
 (launch shell | koopa): user.hyprland_shell()
 
-new scratch (shell | window):
-    user.hyprland_shell()
-    sleep(200ms)
-    user.hyprland_move_to_scratchpad()
-    user.hyprland_show_scratchpad()
+new scratch (shell | window): user.hyprland_new_scratch_terminal()

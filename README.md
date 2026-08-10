@@ -7,6 +7,12 @@ This is a drop in config, that you can drop in alongside the community or any ot
 This takes a progressive enhancement approach to adding features, keeping the core features compositor-agnostic
 while allowing optional compositor-specific app layers.
 
+Shared compositor actions such as `grow window` and `shrink window` reuse Talon
+Community's i3 vocabulary where practical; app layers are not intended as full
+i3 ports. Hyprland is simply the first optional implementation, not a preferred
+or exclusive compositor. Additional integrations are expected under `apps/` as
+the project and its maintainers move between desktop environments.
+
 It is entirely event driven, so it will introduce virtually no latency.
 
 Current features
@@ -14,7 +20,7 @@ Current features
 * Raw keyboard input
 * Eye tracking input: Control Mouse (Legacy) fully supported. (Includes custom "Hiss Mouse" mouse mode)
 * Mouse button commands input. (Touch, Righty, Drag, Wheel Up etc) *Beta: Scrolling support* 
-* Optional Hyprland voice command app layer
+* Optional compositor voice-command app layers (currently Hyprland)
 
 Who is this for
 ===
@@ -75,7 +81,10 @@ F8 repeat=false allow-inhibiting=false hotkey-overlay-title="Talon Toggle Listen
 }
 ```
 
-Hyprland/Omarchy: add this to `~/.config/hypr/bindings.conf` to use F8 to toggle Talon's speech
+Hyprland: the current app layer targets the `hyprlang` config provider;
+Lua-config sessions are not supported. Add this to
+`~/.config/hypr/hyprland.conf` (or a sourced `.conf` file) to use F8 to toggle
+Talon's speech.
 
 ```ini
 bind = , F8, exec, sh -c 'printf "%s\n" "from talon import actions; actions.speech.toggle()" | "$HOME/.talon/bin/repl" >/dev/null'
