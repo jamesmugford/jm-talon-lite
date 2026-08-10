@@ -6,11 +6,11 @@ righty: mouse_click(1)
 
 mid click: mouse_click(2)
 
-<user.modifiers> touch:
-    user.mouse_forwarder_modified_click(modifiers, 0)
+<user.talon_lite_modifiers> touch:
+    user.mouse_forwarder_modified_click(talon_lite_modifiers, 0)
 
-<user.modifiers> righty:
-    user.mouse_forwarder_modified_click(modifiers, 1)
+<user.talon_lite_modifiers> righty:
+    user.mouse_forwarder_modified_click(talon_lite_modifiers, 1)
 
 (dub click | duke):
     mouse_click(0)
