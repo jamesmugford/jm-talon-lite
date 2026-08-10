@@ -15,6 +15,8 @@
 <user.talon_lite_modifiers> <user.unmodified_key>:
     user.talon_lite_key_chord("{talon_lite_modifiers}-{unmodified_key}")
 
+crisp: user.talon_lite_key_chord("ctrl-space")
+
 # Tap modifier keys without supplying another key.
 press <user.talon_lite_modifiers>:
     user.talon_lite_key_chord(talon_lite_modifiers)
