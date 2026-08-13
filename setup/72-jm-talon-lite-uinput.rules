@@ -1,0 +1,2 @@
+# Managed by jm-talon-lite setup/install. Local edits prevent automatic removal.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess"

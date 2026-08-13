@@ -1,6 +1,3 @@
-import subprocess
-import sys
-
 from talon import Context, Module, actions, app, settings
 
 from .shared.pure_utils import resolve_toggle_state
@@ -18,22 +15,8 @@ mod.setting(
 _hiss_mouse_enabled = False
 
 
-def _dotool_click_payload(button: str) -> str:
-    """Return dotool click payload for a mouse button name."""
-    return f"click {button}\n"
-
-
 def _forward_left_click() -> None:
-    try:
-        subprocess.run(
-            ["dotoolc"],
-            input=_dotool_click_payload("left"),
-            text=True,
-            check=False,
-            timeout=0.5,
-        )
-    except Exception as exc:
-        print(f"dotool click error: {exc}", file=sys.stderr, flush=True)
+    actions.mouse_click(0)
 
 
 def _enable_hiss_mouse() -> None:

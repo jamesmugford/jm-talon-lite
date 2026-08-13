@@ -1,6 +1,6 @@
 # Talon Lite
 
-A lightweight shim to forward Talon input to Wayland backends. 
+A lightweight Talon configuration that sends Linux input through `uinput`.
 
 This is a drop in config, that you can drop in alongside the community or any other custom config. 
 
@@ -13,7 +13,9 @@ i3 ports. Hyprland is simply the first optional implementation, not a preferred
 or exclusive compositor. Additional integrations are expected under `apps/` as
 the project and its maintainers move between desktop environments.
 
-It is entirely event driven, so it will introduce virtually no latency.
+The input backend is entirely event driven and compositor agnostic. Talon's
+parsed key and pointer actions map directly to Linux input events in-process;
+there is no helper daemon or compositor-specific input path.
 
 Current features
 ===
@@ -33,23 +35,87 @@ Please note
 **This may not be the Talon you know and love**. If you are used to running Talon under a Linux X11, Mac or Windows
 environment - this will be break a significant number of the features you are used to.
 
-Current supported back ends
+Input backend
 ===
-* Dotool
-* _More can be added (Ideas and pull requests are welcome)_
+* Native Linux `uinput`
 
 
-## Instuctions
+## Instructions
 
 ```sh
 git clone https://github.com/jamesmugford/jm-talon-lite $HOME/.talon/user/jm-talon-lite
 ```
 
-Install Wayland compatible input backend:
+### Input setup
 
-* Currently supported: **Dotool:** https://git.sr.ht/~geb/dotool
+The input backend requires these system prerequisites. The setup scripts check
+them but deliberately do not run a distribution package manager:
 
-dotoold will need to be run in the background, which can be started with e.g. systemd.
+* `libevdev.so.2`
+* `libxkbcommon.so.0`
+* `/dev/uinput`, udev, and an active local login session for seat-based access
+* A host Python 3.9 or newer with `pip`, used only by the explicit installer
+* `setfacl`, used by uninstall to revoke the managed active-seat ACL
+
+Run the installer as your regular desktop user, not with `sudo`:
+
+```sh
+cd "$HOME/.talon/user/jm-talon-lite"
+./setup/install
+```
+
+This installs the hash-locked `libevdev==0.13.1` wheel into the project-specific
+target `$XDG_DATA_HOME/jm-talon-lite/python/`, or
+`$HOME/.local/share/jm-talon-lite/python/` when `XDG_DATA_HOME` is unset. It is
+not a virtual environment, does not use Talon's shared environment, and is
+never installed automatically during Talon startup. Talon uses Python 3.11 or
+newer, so this target does not include the older-Python-only
+`typing_extensions` dependency. The input backend loads this explicit target;
+do not add it globally to `PYTHONPATH`.
+
+Set one explicit XKB layout in the environment that launches Talon. The variant
+is optional but requires a layout. Comma-separated layouts and runtime layout
+switching are not supported yet:
+
+```sh
+export XKB_DEFAULT_LAYOUT=us
+# export XKB_DEFAULT_VARIANT=intl
+```
+
+Reload Talon after installation, then check the complete setup:
+
+```sh
+./setup/doctor
+```
+
+If these variables are not already present in Talon's launch environment,
+restart Talon from that environment rather than using only a config reload.
+
+`doctor` is read-only. It reports `PASS`, `WARN`, and `FAIL` checks for the
+managed Python target and import origin, exact native-library SONAMEs and key
+symbols, effective `/dev/uinput` access, the installed udev rule, the active
+local session, and conflicting broad `uinput` rules. A `FAIL` makes it
+exit nonzero; warnings do not.
+
+Remove only this setup's managed resources with:
+
+```sh
+./setup/uninstall
+```
+
+The installer asks for `sudo` only to install
+`/etc/udev/rules.d/72-jm-talon-lite-uinput.rules`, reload udev rules, and issue
+a targeted change trigger for the existing `uinput` device. The rule grants
+`uaccess` to the active seat; it does not use the `input` group or world-write
+permissions. The scripts do not change Talon settings, install system packages,
+or start or stop Talon.
+
+Uninstall removes the dependency target only when its constrained ownership
+state still matches, and removes the udev rule only when setup recorded it as
+owned and its content and metadata are unchanged. Locally modified or unowned
+resources are preserved with a warning. Because access to `uinput` permits
+synthetic keyboard and pointer input, investigate any broad `MODE=0666` or
+`GROUP=input` rule reported by `doctor`.
 
 > **Arch users:** Talon's Tobii udev rules use the `plugdev` group, which may not exist by default.
 > If Talon detects your Tobii tracker but fails to open it with `EyeOpenErr: Eye Tracker open failed`,
@@ -64,7 +130,7 @@ dotoold will need to be run in the background, which can be started with e.g. sy
 
 ## Dev tests
 
-Run minimal pure-function tests:
+Run the unit and system-library integration tests:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v

@@ -1,0 +1,2 @@
+libevdev==0.13.1 \
+    --hash=sha256:1a15dc796ecb1cba679fc564686f9efab5124efae6e41dba8f4bf377d5a72f4a

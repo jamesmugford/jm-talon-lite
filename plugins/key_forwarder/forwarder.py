@@ -1,51 +1,43 @@
-"""Global Talon key forwarder via dotool."""
+"""Route Talon's Linux key action through uinput."""
 
-from talon import Context, Module, actions, settings
-import subprocess
 import sys
 
-from .dotool_translate import (
-    KeySpec,
-    dotool_actions_to_input,
-    talon_key_to_dotool_actions,
-)
+from talon import Context, app
+from talon.lib.keys import parse_keys
 
-mod = Module()
-mod.setting(
-    "key_forwarder_enabled",
-    type=bool,
-    default=False,
-    desc="Forward Talon key() through external backend (global).",
-)
+try:
+    from ..input_backend.backend import InputError
+    from ..input_backend.talon_input import get_input
+except ImportError:  # Pure tests import this package from plugins/.
+    from input_backend.backend import InputError
+    from input_backend.talon_input import get_input
+
 
 ctx = Context()
+ctx.matches = "os: linux"
+
+_last_error: str | None = None
+
+
+def _report_error(error: Exception) -> None:
+    global _last_error
+    message = str(error)
+    if message == _last_error:
+        return
+    _last_error = message
+    print(f"native keyboard error: {message}", file=sys.stderr, flush=True)
+    app.notify(message)
 
 
 @ctx.action_class("main")
 class MainActions:
     @staticmethod
-    def key(key: KeySpec):
-        """Log and forward Talon key specs through dotoolc.
-
-        Args:
-            key: Talon key spec string.
-        """
-        if not settings.get("user.key_forwarder_enabled"):
-            actions.next(key)
-            return
-        print(f"dotool key: {key!r}", file=sys.stderr, flush=True)
+    def key(key: str):
+        """Send a Talon key specification through uinput."""
+        global _last_error
         try:
-            # TODO: pass log_unknown callback to surface unmapped keys.
-            actions_list = talon_key_to_dotool_actions(key)
-            if not actions_list:
-                return
-            # Send a small batch to dotoolc (dotoold should be running).
-            subprocess.run(
-                ["dotoolc"],
-                input=dotool_actions_to_input(actions_list),
-                text=True,
-                check=False,
-                timeout=0.5,
-            )
-        except Exception as exc:
-            print(f"dotool error: {exc}", file=sys.stderr, flush=True)
+            get_input().key(parse_keys(key))
+        except (InputError, RuntimeError, ValueError) as exc:
+            _report_error(exc)
+        else:
+            _last_error = None
