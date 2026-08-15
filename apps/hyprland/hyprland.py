@@ -1,8 +1,7 @@
-import json
 import os
 import subprocess
 import sys
-from typing import Optional, Union
+from typing import Union
 
 from talon import Context, Module, app, settings
 
@@ -16,18 +15,6 @@ mod.setting(
     type=bool,
     default=True,
     desc="Automatically enable the Hyprland tag when Talon is running under Hyprland.",
-)
-mod.setting(
-    "hyprland_terminal_command",
-    type=str,
-    default="xdg-terminal-exec",
-    desc="Command Hyprland should run for a terminal.",
-)
-mod.setting(
-    "hyprland_lock_command",
-    type=str,
-    default="hyprlock",
-    desc="Command Hyprland should run to lock the session.",
 )
 
 tag_ctx.matches = r"""
@@ -86,35 +73,45 @@ def _hyprctl(*args: str) -> None:
         print(f"hyprland hyprctl error: {output}", file=sys.stderr, flush=True)
 
 
-def _hyprctl_json(command: str) -> dict | list | None:
-    result = _run_hyprctl("-j", command)
+def _eval(code: str) -> None:
+    result = _run_hyprctl("eval", code)
     if result is None:
-        return None
+        return
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
         print(f"hyprland hyprctl error: {message}", file=sys.stderr, flush=True)
-        return None
-    try:
-        value = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        print(f"hyprland hyprctl JSON error: {exc}", file=sys.stderr, flush=True)
-        return None
-    return value if isinstance(value, (dict, list)) else None
-
-
-def _dispatch(dispatcher: str, arg: Optional[str] = None) -> None:
-    if arg is None or arg == "":
-        _hyprctl("dispatch", dispatcher)
         return
-    _hyprctl("dispatch", dispatcher, arg)
+
+    output = result.stdout.strip()
+    if output and any(line.strip().lower() != "ok" for line in output.splitlines()):
+        print(f"hyprland hyprctl error: {output}", file=sys.stderr, flush=True)
 
 
-def _exec(command: str) -> None:
-    command = command.strip()
-    if not command:
-        app.notify("Hyprland command cannot be empty.")
-        return
-    _dispatch("exec", command)
+def _lua_string(value: str) -> str:
+    escapes = {
+        "\a": r"\a",
+        "\b": r"\b",
+        "\f": r"\f",
+        "\n": r"\n",
+        "\r": r"\r",
+        "\t": r"\t",
+        "\v": r"\v",
+        '"': r'\"',
+        "\\": r"\\",
+    }
+    encoded = []
+    for char in value:
+        if char in escapes:
+            encoded.append(escapes[char])
+        elif ord(char) < 32 or ord(char) == 127:
+            encoded.append(f"\\{ord(char):03d}")
+        else:
+            encoded.append(char)
+    return '"' + "".join(encoded) + '"'
+
+
+def _dispatch(dispatcher: str) -> None:
+    _eval(f"hl.dispatch({dispatcher})")
 
 
 def _direction(value: str) -> str:
@@ -127,162 +124,128 @@ def _direction(value: str) -> str:
     return directions.get(value, value)
 
 
-def _workspace_arg(which: Union[str, int]) -> str:
-    return str(which)
-
-
-def _launch_scratch_terminal() -> None:
-    command = _setting("user.hyprland_terminal_command", "xdg-terminal-exec").strip()
-    if not command:
-        app.notify("Terminal command cannot be empty.")
-        return
-    _dispatch("exec", f"[workspace special:scratchpad] {command}")
-
-
-def _resolve_window_tiled_layout(window: dict, workspaces: list) -> str | None:
-    """Purely resolve a window's tiled layout from Hyprland metadata.
-
-    Args:
-        window: Metadata from ``hyprctl -j activewindow``.
-        workspaces: Metadata from ``hyprctl -j workspaces``.
-
-    Returns:
-        The tiled layout name, or ``None`` when it cannot be resolved.
-    """
-    window_workspace = window.get("workspace")
-    if not isinstance(window_workspace, dict):
-        return None
-
-    # Match the focused window's workspace, including special workspaces.
-    workspace_id = window_workspace.get("id")
-    for workspace in workspaces:
-        if not isinstance(workspace, dict) or workspace.get("id") != workspace_id:
-            continue
-        layout = workspace.get("tiledLayout")
-        return layout if isinstance(layout, str) else None
-    return None
-
-
-def _resize_active_window_by_pixels(direction: int) -> None:
-    pixels = direction * 100
-    _dispatch("resizeactive", f"{pixels} {pixels}")
+def _workspace_selector(which: Union[str, int]) -> str:
+    return _lua_string(str(which))
 
 
 def _resize_active_window(direction: int) -> None:
     direction = 1 if direction > 0 else -1
-    window = _hyprctl_json("activewindow")
+    pixels = direction * 100
+    _eval(
+        "local window = hl.get_active_window(); "
+        "if window then "
+        f"hl.dispatch(hl.dsp.window.resize({{ x = {pixels}, y = {pixels}, relative = true }})); "
+        "if window.floating then hl.dispatch(hl.dsp.window.center()) end "
+        "end"
+    )
 
-    if not isinstance(window, dict):
-        _resize_active_window_by_pixels(direction)
+
+def _focus_mode_toggle() -> None:
+    _eval(
+        "local window = hl.get_active_window(); "
+        "if window and window.workspace then "
+        "local target, best_id; "
+        "for _, candidate in ipairs(hl.get_windows({ "
+        "workspace = window.workspace, floating = not window.floating "
+        "})) do "
+        "local id = candidate.focus_history_id; "
+        "if not target or (id >= 0 and (best_id < 0 or id < best_id)) then "
+        "target, best_id = candidate, id "
+        "end "
+        "end "
+        "if target then hl.dispatch(hl.dsp.focus({ window = target })) end "
+        "end"
+    )
+
+
+def _move_active_window(direction: str) -> None:
+    direction = _direction(direction)
+    offsets = {
+        "l": (-10, 0),
+        "r": (10, 0),
+        "u": (0, -10),
+        "d": (0, 10),
+    }
+    if direction not in offsets:
+        _dispatch(
+            f"hl.dsp.window.move({{ direction = {_lua_string(direction)} }})"
+        )
         return
 
-    # Floating windows resize directly, then recenter like Community i3.
-    if window.get("floating", False):
-        _resize_active_window_by_pixels(direction)
-        _dispatch("centerwindow")
-        return
-
-    workspaces = _hyprctl_json("workspaces")
-    if not isinstance(workspaces, list):
-        _resize_active_window_by_pixels(direction)
-        return
-
-    # Scrolling tiles resize by column rather than generic window pixels.
-    if _resolve_window_tiled_layout(window, workspaces) == "scrolling":
-        _dispatch("layoutmsg", f"colresize {direction * 0.1:+g}")
-        return
-
-    # Other tiled layouts use Hyprland's generic pixel resize fallback.
-    _resize_active_window_by_pixels(direction)
+    x, y = offsets[direction]
+    direction = _lua_string(direction)
+    _eval(
+        "local window = hl.get_active_window(); "
+        "if window then "
+        "if window.floating then "
+        f"hl.dispatch(hl.dsp.window.move({{ x = {x}, y = {y}, relative = true }})) "
+        "else "
+        f"hl.dispatch(hl.dsp.window.move({{ direction = {direction} }})) "
+        "end "
+        "end"
+    )
 
 
 @ctx.action_class("app")
 class AppActions:
     def window_close():
-        _dispatch("killactive")
+        _dispatch("hl.dsp.window.close()")
 
 
 @mod.action_class
 class Actions:
-    def hyprland_dispatch(dispatcher: str, arg: Optional[str] = None):
-        """Run a legacy Hyprland dispatcher."""
-        _dispatch(dispatcher, arg)
-
-    def hyprland_exec(command: str):
-        """Run a command through Hyprland."""
-        _exec(command)
-
     def hyprland_reload():
         """Reload the Hyprland config."""
         _hyprctl("reload")
 
     def hyprland_focus(what: str):
         """Move focus."""
-        _dispatch("movefocus", _direction(what))
+        direction = _lua_string(_direction(what))
+        _dispatch(f"hl.dsp.focus({{ direction = {direction} }})")
 
-    def hyprland_swap(direction: str):
-        """Swap the active window in a direction."""
-        _dispatch("swapwindow", _direction(direction))
+    def hyprland_focus_mode_toggle():
+        """Switch focus between tiled and floating windows."""
+        _focus_mode_toggle()
+
+    def hyprland_move(direction: str):
+        """Move the active window in a direction."""
+        _move_active_window(direction)
 
     def hyprland_switch_to_workspace(which: Union[str, int]):
         """Focus the specified workspace."""
-        _dispatch("workspace", _workspace_arg(which))
+        workspace = _workspace_selector(which)
+        _dispatch(f"hl.dsp.focus({{ workspace = {workspace} }})")
 
     def hyprland_move_to_workspace(which: Union[str, int]):
         """Move the active window to the specified workspace."""
-        _dispatch("movetoworkspace", _workspace_arg(which))
+        workspace = _workspace_selector(which)
+        _dispatch(f"hl.dsp.window.move({{ workspace = {workspace}, follow = false }})")
 
     def hyprland_move_to_scratchpad():
         """Move the active window to the scratchpad."""
-        _dispatch("movetoworkspacesilent", "special:scratchpad")
+        _dispatch(
+            'hl.dsp.window.move({ workspace = "special:scratchpad", follow = false })'
+        )
 
     def hyprland_show_scratchpad():
         """Toggle the scratchpad workspace."""
-        _dispatch("togglespecialworkspace", "scratchpad")
+        _dispatch('hl.dsp.workspace.toggle_special("scratchpad")')
 
     def hyprland_fullscreen():
         """Toggle fullscreen for the active window."""
-        _dispatch("fullscreen", "0")
-
-    def hyprland_full_width():
-        """Toggle maximized mode for the active window."""
-        _dispatch("fullscreen", "1")
+        _dispatch('hl.dsp.window.fullscreen({ mode = "fullscreen" })')
 
     def hyprland_float():
         """Toggle floating for the active window."""
-        _dispatch("togglefloating")
+        _dispatch('hl.dsp.window.float({ action = "toggle" })')
 
     def hyprland_center():
         """Center the active floating window."""
-        _dispatch("centerwindow")
-
-    def hyprland_toggle_split():
-        """Toggle dwindle split direction."""
-        _dispatch("layoutmsg", "togglesplit")
-
-    def hyprland_preselect(direction: str):
-        """Preselect where the next dwindle window should open."""
-        _dispatch("layoutmsg", f"preselect {_direction(direction)}")
-
-    def hyprland_resize_column(delta: float):
-        """Resize the active scrolling-layout column."""
-        _dispatch("layoutmsg", f"colresize {delta:+g}")
+        _dispatch("hl.dsp.window.center()")
 
     def hyprland_resize_window(direction: int):
-        """Grow or shrink using behavior appropriate for the active layout."""
+        """Grow or shrink the active window."""
         _resize_active_window(direction)
-
-    def hyprland_shell():
-        """Launch the configured terminal."""
-        _exec(_setting("user.hyprland_terminal_command", "xdg-terminal-exec"))
-
-    def hyprland_lock():
-        """Run the configured screen lock command."""
-        _exec(_setting("user.hyprland_lock_command", "hyprlock"))
-
-    def hyprland_new_scratch_terminal():
-        """Launch a terminal directly on the scratchpad workspace."""
-        _launch_scratch_terminal()
 
 
 def _on_ready() -> None:

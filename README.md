@@ -81,13 +81,18 @@ F8 repeat=false allow-inhibiting=false hotkey-overlay-title="Talon Toggle Listen
 }
 ```
 
-Hyprland: the current app layer targets the `hyprlang` config provider;
-Lua-config sessions are not supported. Add this to
-`~/.config/hypr/hyprland.conf` (or a sourced `.conf` file) to use F8 to toggle
-Talon's speech.
+Hyprland: add this to a loaded Lua config module to use F8 to toggle Talon's
+speech. For example, Omarchy loads `~/.config/hypr/bindings.lua` from its main
+Hyprland config.
 
-```ini
-bind = , F8, exec, sh -c 'printf "%s\n" "from talon import actions; actions.speech.toggle()" | "$HOME/.talon/bin/repl" >/dev/null'
+```lua
+hl.bind(
+  "code:74",
+  hl.dsp.exec_cmd(
+    [[sh -c 'printf "%s\n" "from talon import actions; actions.speech.toggle()" | "$HOME/.talon/bin/repl" >/dev/null']]
+  ),
+  { description = "Talon toggle listen" }
+)
 ```
 
 Other projects
