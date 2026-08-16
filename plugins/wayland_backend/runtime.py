@@ -313,12 +313,23 @@ class WaylandRuntime:
             )
 
     def pointer_move_absolute(
-        self, x: float, y: float, timeout: float = 1.0
+        self,
+        x: float,
+        y: float,
+        *,
+        refresh_hover: bool = False,
+        timeout: float = 1.0,
     ) -> None:
         """Move the virtual pointer to normalized desktop coordinates."""
+        if type(refresh_hover) is not bool:
+            raise TypeError("Pointer hover refresh must be a boolean")
         x_value, y_value = normalized_to_extent(x, y)
         self._submit(
-            lambda: self._emit_pointer_absolute(x_value, y_value),
+            lambda: self._emit_pointer_absolute(
+                x_value,
+                y_value,
+                refresh_hover,
+            ),
             timeout,
         )
 
@@ -350,6 +361,17 @@ class WaylandRuntime:
         """Press and release a supported Talon mouse button."""
         button_code = linux_button_code(button)
         self._submit(lambda: self._emit_pointer_click(button_code), timeout)
+
+    def pointer_button_toggle(
+        self, button: int = 0, timeout: float = 1.0
+    ) -> bool:
+        """Toggle a supported Talon mouse button and return its new state."""
+        button_code = linux_button_code(button)
+        return self._submit(lambda: self._emit_pointer_toggle(button_code), timeout)
+
+    def pointer_release_all(self, timeout: float = 1.0) -> bool:
+        """Release all held pointer buttons and report whether any were held."""
+        return self._submit(self._emit_pointer_release_all, timeout)
 
     def pointer_scroll(
         self,
@@ -1036,11 +1058,7 @@ class WaylandRuntime:
             raise RuntimeError("Cannot click a pointer button that is already held")
         self._emit_key_spec(down)
         try:
-            try:
-                self._emit_pointer_click(button_code)
-            except Exception as exc:
-                self._record_failure(exc)
-                raise
+            self._emit_pointer_click(button_code)
         finally:
             self._emit_key_spec(up)
 
@@ -1114,23 +1132,40 @@ class WaylandRuntime:
             raise RuntimeError("Wayland virtual pointer is not ready")
         return pointer
 
-    def _emit_pointer_absolute(self, x: int, y: int) -> None:
+    def _emit_pointer_absolute(
+        self, x: int, y: int, refresh_hover: bool = False
+    ) -> None:
         pointer = self._require_virtual_pointer()
-        pointer.motion_absolute(
-            self._timestamp_ms(),
-            x,
-            y,
-            POINTER_EXTENT,
-            POINTER_EXTENT,
-        )
-        pointer.frame()
+        try:
+            pointer.motion_absolute(
+                self._timestamp_ms(),
+                x,
+                y,
+                POINTER_EXTENT,
+                POINTER_EXTENT,
+            )
+            pointer.frame()
+            if refresh_hover:
+                # A relative nudge makes compositors recalculate hover/focus.
+                nudge = -1.0 if x == POINTER_EXTENT else 1.0
+                pointer.motion(self._timestamp_ms(), nudge, 0.0)
+                pointer.frame()
+                pointer.motion(self._timestamp_ms(), -nudge, 0.0)
+                pointer.frame()
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
     def _emit_pointer_relative(self, dx: float, dy: float) -> None:
         dx = validate_wayland_fixed(dx, "Pointer x delta")
         dy = validate_wayland_fixed(dy, "Pointer y delta")
         pointer = self._require_virtual_pointer()
-        pointer.motion(self._timestamp_ms(), dx, dy)
-        pointer.frame()
+        try:
+            pointer.motion(self._timestamp_ms(), dx, dy)
+            pointer.frame()
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
     def _emit_pointer_button(self, button_code: int, *, pressed: bool) -> None:
         if pressed and button_code in self._pressed_pointer_buttons:
@@ -1138,28 +1173,48 @@ class WaylandRuntime:
         if not pressed and button_code not in self._pressed_pointer_buttons:
             return
         pointer = self._require_virtual_pointer()
-        pointer.button(
-            self._timestamp_ms(),
-            button_code,
-            _BUTTON_PRESSED if pressed else _BUTTON_RELEASED,
-        )
-        if pressed:
-            self._pressed_pointer_buttons.add(button_code)
-        else:
-            self._pressed_pointer_buttons.remove(button_code)
-        pointer.frame()
+        try:
+            pointer.button(
+                self._timestamp_ms(),
+                button_code,
+                _BUTTON_PRESSED if pressed else _BUTTON_RELEASED,
+            )
+            if pressed:
+                self._pressed_pointer_buttons.add(button_code)
+            pointer.frame()
+            if not pressed:
+                self._pressed_pointer_buttons.remove(button_code)
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
     def _emit_pointer_click(self, button_code: int) -> None:
         if button_code in self._pressed_pointer_buttons:
             raise RuntimeError("Cannot click a pointer button that is already held")
         pointer = self._require_virtual_pointer()
-        timestamp = self._timestamp_ms()
-        pointer.button(timestamp, button_code, _BUTTON_PRESSED)
-        self._pressed_pointer_buttons.add(button_code)
-        pointer.frame()
-        pointer.button(timestamp, button_code, _BUTTON_RELEASED)
-        self._pressed_pointer_buttons.remove(button_code)
-        pointer.frame()
+        try:
+            timestamp = self._timestamp_ms()
+            pointer.button(timestamp, button_code, _BUTTON_PRESSED)
+            self._pressed_pointer_buttons.add(button_code)
+            pointer.frame()
+            pointer.button(timestamp, button_code, _BUTTON_RELEASED)
+            pointer.frame()
+            self._pressed_pointer_buttons.remove(button_code)
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+
+    def _emit_pointer_toggle(self, button_code: int) -> bool:
+        pressed = button_code not in self._pressed_pointer_buttons
+        self._emit_pointer_button(button_code, pressed=pressed)
+        return pressed
+
+    def _emit_pointer_release_all(self) -> bool:
+        self._require_virtual_pointer()
+        held = tuple(sorted(self._pressed_pointer_buttons))
+        for button_code in held:
+            self._emit_pointer_button(button_code, pressed=False)
+        return bool(held)
 
     def _emit_pointer_scroll(
         self, vertical_steps: int, horizontal_steps: int
@@ -1175,23 +1230,27 @@ class WaylandRuntime:
             "Horizontal scroll distance",
         )
         pointer = self._require_virtual_pointer()
-        timestamp = self._timestamp_ms()
-        pointer.axis_source(_AXIS_SOURCE_WHEEL)
-        if vertical_steps:
-            pointer.axis_discrete(
-                timestamp,
-                _AXIS_VERTICAL,
-                vertical_value,
-                vertical_steps,
-            )
-        if horizontal_steps:
-            pointer.axis_discrete(
-                timestamp,
-                _AXIS_HORIZONTAL,
-                horizontal_value,
-                horizontal_steps,
-            )
-        pointer.frame()
+        try:
+            timestamp = self._timestamp_ms()
+            pointer.axis_source(_AXIS_SOURCE_WHEEL)
+            if vertical_steps:
+                pointer.axis_discrete(
+                    timestamp,
+                    _AXIS_VERTICAL,
+                    vertical_value,
+                    vertical_steps,
+                )
+            if horizontal_steps:
+                pointer.axis_discrete(
+                    timestamp,
+                    _AXIS_HORIZONTAL,
+                    horizontal_value,
+                    horizontal_steps,
+                )
+            pointer.frame()
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
     def _on_global_remove(self, registry: Any, name: int) -> None:
         announcement = self._announced_globals.pop(name, None)

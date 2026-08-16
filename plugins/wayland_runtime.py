@@ -21,44 +21,40 @@ setattr(sys, _RUNTIME_KEY, _runtime)
 
 @mod.action_class
 class Actions:
-    def wayland_runtime_start() -> None:
-        """Start Wayland discovery and virtual input."""
-        _runtime.start()
-        print(f"Wayland runtime started: {_runtime.status()}")
-
-    def wayland_runtime_stop() -> None:
-        """Stop the Wayland runtime."""
-        _runtime.stop()
-        print("Wayland runtime stopped")
-
-    def wayland_runtime_status() -> str:
-        """Return the Wayland runtime status."""
-        return str(_runtime.status())
-
-    def wayland_pointer_move_absolute(x: float, y: float) -> None:
-        """Move the staged pointer to normalized 0..1 desktop coordinates."""
-        _runtime.pointer_move_absolute(x, y)
+    def wayland_pointer_move_absolute(
+        x: float, y: float, refresh_hover: bool = False
+    ) -> None:
+        """Move the pointer to normalized 0..1 desktop coordinates."""
+        _runtime.pointer_move_absolute(x, y, refresh_hover=refresh_hover)
 
     def wayland_pointer_move_relative(dx: float, dy: float) -> None:
-        """Move the staged pointer by a relative compositor-space delta."""
+        """Move the pointer by a relative compositor-space delta."""
         _runtime.pointer_move_relative(dx, dy)
 
     def wayland_pointer_button_down(button: int = 0) -> None:
-        """Press a button with the staged virtual pointer."""
+        """Press a button with the virtual pointer."""
         _runtime.pointer_button_down(button)
 
     def wayland_pointer_button_up(button: int = 0) -> None:
-        """Release a button with the staged virtual pointer."""
+        """Release a button with the virtual pointer."""
         _runtime.pointer_button_up(button)
 
     def wayland_pointer_click(button: int = 0) -> None:
-        """Click a button with the staged virtual pointer."""
+        """Click a button with the virtual pointer."""
         _runtime.pointer_click(button)
+
+    def wayland_pointer_button_toggle(button: int = 0) -> bool:
+        """Toggle a button with the virtual pointer."""
+        return _runtime.pointer_button_toggle(button)
+
+    def wayland_pointer_release_all() -> bool:
+        """Release every button held by the virtual pointer."""
+        return _runtime.pointer_release_all()
 
     def wayland_pointer_scroll(
         vertical_steps: int = 0, horizontal_steps: int = 0
     ) -> None:
-        """Scroll discrete steps with the staged virtual pointer."""
+        """Scroll discrete steps with the virtual pointer."""
         _runtime.pointer_scroll(vertical_steps, horizontal_steps)
 
     def wayland_pointer_modified_click(

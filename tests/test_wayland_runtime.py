@@ -1008,7 +1008,7 @@ class WaylandRuntimeTests(unittest.TestCase):
             "wayland_backend.runtime.time.monotonic_ns",
             return_value=1_234_000_000,
         ):
-            runtime.pointer_move_absolute(-1.0, 2.0)
+            runtime.pointer_move_absolute(-1.0, 2.0, refresh_hover=True)
             runtime.pointer_move_relative(2.5, -3.5)
             runtime.pointer_button_down(0)
             runtime.pointer_button_down(0)
@@ -1020,6 +1020,10 @@ class WaylandRuntimeTests(unittest.TestCase):
             pointer.calls,
             [
                 ("motion_absolute", 1234, 0, 65535, 65535, 65535),
+                ("frame",),
+                ("motion", 1234, 1.0, 0.0),
+                ("frame",),
+                ("motion", 1234, -1.0, 0.0),
                 ("frame",),
                 ("motion", 1234, 2.5, -3.5),
                 ("frame",),
@@ -1037,6 +1041,114 @@ class WaylandRuntimeTests(unittest.TestCase):
                 ("frame",),
             ],
         )
+
+    def test_pointer_toggle_and_release_all_use_runtime_button_state(self):
+        runtime = WaylandRuntime()
+        pointer = _FakeProxy()
+        runtime._running.set()
+        runtime._owner_thread_id = threading.get_ident()
+        runtime._virtual_pointer = pointer
+
+        with patch(
+            "wayland_backend.runtime.time.monotonic_ns",
+            return_value=2_000_000,
+        ):
+            self.assertTrue(runtime.pointer_button_toggle(2))
+            self.assertFalse(runtime.pointer_button_toggle(2))
+            runtime.pointer_button_down(2)
+            runtime.pointer_button_down(0)
+            self.assertTrue(runtime.pointer_release_all())
+            self.assertFalse(runtime.pointer_release_all())
+
+        self.assertEqual(
+            pointer.calls,
+            [
+                ("button", 2, 0x112, 1),
+                ("frame",),
+                ("button", 2, 0x112, 0),
+                ("frame",),
+                ("button", 2, 0x112, 1),
+                ("frame",),
+                ("button", 2, 0x110, 1),
+                ("frame",),
+                ("button", 2, 0x110, 0),
+                ("frame",),
+                ("button", 2, 0x112, 0),
+                ("frame",),
+            ],
+        )
+        self.assertFalse(runtime._pressed_pointer_buttons)
+
+    def test_hover_refresh_restores_position_at_right_edge(self):
+        runtime = WaylandRuntime()
+        pointer = _FakeProxy()
+        runtime._running.set()
+        runtime._owner_thread_id = threading.get_ident()
+        runtime._virtual_pointer = pointer
+
+        with patch(
+            "wayland_backend.runtime.time.monotonic_ns",
+            return_value=3_000_000,
+        ):
+            runtime.pointer_move_absolute(1.0, 0.5, refresh_hover=True)
+
+        self.assertEqual(
+            pointer.calls,
+            [
+                ("motion_absolute", 3, 65535, 32768, 65535, 65535),
+                ("frame",),
+                ("motion", 3, -1.0, 0.0),
+                ("frame",),
+                ("motion", 3, 1.0, 0.0),
+                ("frame",),
+            ],
+        )
+
+    def test_pointer_request_failure_stops_runtime_and_preserves_held_state(self):
+        runtime = WaylandRuntime()
+        pointer = _FakeProxy()
+        runtime._running.set()
+        runtime._owner_thread_id = threading.get_ident()
+        runtime._virtual_pointer = pointer
+
+        with patch.object(
+            pointer,
+            "frame",
+            side_effect=RuntimeError("pointer frame failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "pointer frame failed"):
+                runtime.pointer_click()
+
+        self.assertTrue(runtime._stopping.is_set())
+        self.assertEqual(
+            runtime.status().error,
+            "RuntimeError: pointer frame failed",
+        )
+        self.assertEqual(runtime._pressed_pointer_buttons, {0x110})
+
+        runtime._destroy_virtual_pointer()
+        self.assertFalse(runtime._pressed_pointer_buttons)
+        self.assertTrue(pointer.destroyed)
+
+    def test_click_release_frame_failure_is_retried_during_teardown(self):
+        runtime = WaylandRuntime()
+        pointer = _FakeProxy()
+        runtime._running.set()
+        runtime._owner_thread_id = threading.get_ident()
+        runtime._virtual_pointer = pointer
+
+        with patch.object(
+            pointer,
+            "frame",
+            side_effect=(None, RuntimeError("release frame failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release frame failed"):
+                runtime.pointer_click()
+
+        self.assertEqual(runtime._pressed_pointer_buttons, {0x110})
+        runtime._destroy_virtual_pointer()
+        self.assertFalse(runtime._pressed_pointer_buttons)
+        self.assertEqual(pointer.calls[-1], ("destroy",))
 
     def test_pointer_teardown_releases_held_buttons(self):
         runtime = WaylandRuntime()
@@ -1103,6 +1215,8 @@ class WaylandRuntimeTests(unittest.TestCase):
             runtime.pointer_move_relative(1 << 23, 0)
         with self.assertRaises(ValueError):
             runtime.pointer_scroll(vertical_steps=(1 << 31) - 1)
+        with self.assertRaises(TypeError):
+            runtime.pointer_move_absolute(0.5, 0.5, refresh_hover=1)
 
         self.assertEqual(pointer.calls, [])
 

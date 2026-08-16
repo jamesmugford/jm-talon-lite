@@ -36,7 +36,7 @@ environment - this will be break a significant number of the features you are us
 Current supported back ends
 ===
 * In-process Wayland virtual keyboard
-* Dotool for pointer forwarding while the native pointer migration is completed
+* In-process Wayland virtual pointer
 
 The in-process runtime supports Talon's CPython 3.13 x86-64 build on Linux with
 glibc 2.34 or newer and `libxkbcommon.so.0`. It starts automatically in Wayland
@@ -44,26 +44,13 @@ sessions and routes `actions.key()` through `zwp_virtual_keyboard_manager_v1`.
 The runtime mirrors the selected seat's compositor-provided XKB keymap, so
 letters and symbols follow that layout without a separate remapping table.
 Talon key sequences, chords, `:down`, `:up`, and repeat suffixes are supported.
-Use `user.wayland_runtime_status()` to confirm `virtual_keyboard_ready=True`.
 The virtual keyboard starts in keymap group 0 and follows later lock or layout
 events when the compositor supplies them to the headless Talon connection.
 
-The same runtime also exposes a staged virtual pointer. Pointer diagnostics
-require `zwlr_virtual_pointer_manager_v1`; wait for
-`virtual_pointer_ready=True` before using them. The explicit
-`user.wayland_runtime_start()` and `user.wayland_runtime_stop()` actions remain
-available for diagnostics.
-
-Pointer diagnostics clamp absolute coordinates to `0..1`, accept relative
-compositor-space deltas, and map Talon buttons `0`, `1`, and `2` to left,
-right, and middle. Positive vertical wheel steps scroll down:
-
-```python
-actions.user.wayland_pointer_move_absolute(0.5, 0.5)
-actions.user.wayland_pointer_move_relative(1, 0)
-actions.user.wayland_pointer_click(0)
-actions.user.wayland_pointer_scroll(vertical_steps=1)
-```
+The same runtime also exposes a virtual pointer for mouse, gaze, and hiss input.
+It requires `zwlr_virtual_pointer_manager_v1`, clamps absolute coordinates to
+the normalized desktop, and maps Talon buttons `0`, `1`, and `2` to left,
+right, and middle.
 
 ## Instuctions
 
@@ -71,12 +58,8 @@ actions.user.wayland_pointer_scroll(vertical_steps=1)
 git clone https://github.com/jamesmugford/jm-talon-lite $HOME/.talon/user/jm-talon-lite
 ```
 
-Pointer forwarding still requires Dotool until the native pointer migration is
-complete:
-
-* Currently supported: **Dotool:** https://git.sr.ht/~geb/dotool
-
-dotoold will need to be run in the background, which can be started with e.g. systemd.
+Pointer forwarding uses the in-process Wayland runtime and does not require a
+separate input daemon.
 
 > **Arch users:** Talon's Tobii udev rules use the `plugdev` group, which may not exist by default.
 > If Talon detects your Tobii tracker but fails to open it with `EyeOpenErr: Eye Tracker open failed`,
