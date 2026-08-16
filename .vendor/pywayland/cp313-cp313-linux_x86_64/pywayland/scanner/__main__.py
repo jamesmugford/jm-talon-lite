@@ -1,0 +1,147 @@
+# Copyright 2015 Sean Vig
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import shlex
+import subprocess
+
+from .protocol import Protocol
+
+logger = logging.getLogger(__name__)
+
+
+def pkgconfig(package: str, variable: str) -> str:
+    """pkg-config"""
+    pkgconfig_env = os.environ.get("PKG_CONFIG", "pkg-config")
+    cmd = f"{pkgconfig_env} --variable={variable} {package}"
+    args = shlex.split(cmd)
+    return subprocess.check_output(args).decode().strip()
+
+
+def get_wayland_protocols(input_dir: str | None = None) -> list[str]:
+    if input_dir:
+        protocols_dir = input_dir
+    else:
+        # use pkg-config to try to find the wayland-protocol directory
+        try:
+            protocols_dir = pkgconfig("wayland-protocols", "pkgdatadir")
+        except subprocess.CalledProcessError:
+            raise OSError("Unable to find wayland-protocols using pkgconfig")
+
+    protocols = []
+    # wayland protocols stages in incremental importance
+    for stages in ("unstable", "staging", "stable"):
+        # walk the wayland-protocol dir
+        for dirpath, _, filenames in os.walk(os.path.join(protocols_dir, stages)):
+            for filename in filenames:
+                _, file_ext = os.path.splitext(filename)
+                # only generate protocols for xml files
+                if file_ext == ".xml":
+                    protocols.append(os.path.join(dirpath, filename))
+    return protocols
+
+
+def main() -> None:
+    this_dir = os.path.split(__file__)[0]
+    protocol_dir = os.path.join(this_dir, "..", "protocol")
+
+    # try to figure out where the wayland.xml file is installed, otherwise use
+    # default
+    try:
+        xml_dir = pkgconfig("wayland-scanner", "pkgdatadir")
+        xml_file = os.path.join(xml_dir, "wayland.xml")
+    except subprocess.CalledProcessError:
+        xml_file = "/usr/share/wayland/wayland.xml"
+
+    parser = argparse.ArgumentParser(
+        description="Generate wayland protocol files from xml"
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        metavar="DIR",
+        default=protocol_dir,
+        type=str,
+        help="Directory to output protocol files",
+    )
+    parser.add_argument(
+        "--with-protocols",
+        action="store_true",
+        help="Also locate and build wayland-protocol xml files (using pkg-config)",
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        metavar="XML_FILE",
+        default=[xml_file],
+        nargs="+",
+        type=str,
+        help="Path to input xml file to scan",
+    )
+    parser.add_argument(
+        "--input-protocols",
+        metavar="DIR",
+        type=str,
+        help="Custom directory to wayland-protocol xml files instead of pkg-config",
+    )
+
+    args = parser.parse_args()
+
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir, 0o775)
+
+    input_files = []
+
+    if args.with_protocols:
+        protocols_files = get_wayland_protocols(args.input_protocols)
+        input_files += protocols_files
+
+    # add wayland.xml at last
+    input_files += args.input
+
+    protocols = [Protocol.parse_file(input_file) for input_file in input_files]
+    logger.info(f"Parsed {len(protocols)} input xml files")
+
+    # items are created in order of importance (1.stable, 2.staging, 3.unstable)
+    # in case duplicates appear in the protocols
+    all_imports = {
+        interface.name: protocol.name
+        for protocol in protocols
+        for interface in protocol.interface
+    }
+
+    for protocol in protocols:
+        # create a new copy so that we can overwrite created interface keys with
+        # the interfaces in the current protocol, this is in case an interface name
+        # is repeated multiple times fixing the issue of importing and redifining
+        # the interface in the same protocol file
+        # if a protocol other than the ones with repeated interfaces where to referece
+        # the interface name, it would resolve to the interface with highest priority
+        # (1.stable, 2.staging, 3.unstable) since the xml files does not have a hard
+        # referece to the wanted interface protocol
+        current_protocol_imports = all_imports.copy()
+        current_protocol_imports.update(
+            {interface.name: protocol.name for interface in protocol.interface}
+        )
+        protocol.output(args.output_dir, current_protocol_imports)
+        logger.info(f"Generated protocol: {protocol.name}")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    main()

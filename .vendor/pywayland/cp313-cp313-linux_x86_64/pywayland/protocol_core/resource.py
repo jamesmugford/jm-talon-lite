@@ -1,0 +1,117 @@
+# Copyright 2015 Sean Vig
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Generic, TypeVar
+
+from pywayland import ffi, lib
+from pywayland.dispatcher import Dispatcher
+from pywayland.server.client import Client
+from pywayland.utils import ensure_valid
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from pywayland.server.listener import Listener
+
+    from .interface import Interface
+
+    T = TypeVar("T", bound=Interface)
+else:
+    T = TypeVar("T")
+
+
+class Resource(Generic[T]):
+    """A server-side Interface object for the client
+
+    Not created directly, created from the
+    :class:`~pywayland.interface.Interface` object.
+
+    :param client: The client that the Resource is for
+    :type client: :class:`~pywayland.server.Client` or cdata for ``wl_client *``
+    :param version: The version to use for the
+                    :class:`~pywayland.interface.Interface`, uses current
+                    version if not specified
+    :type version: `int`
+    :param id: The id for the item
+    :type id: `int`
+    """
+
+    interface: type[T]
+
+    def __init__(
+        self, client: Client | ffi.WlClient, version: int | None = None, id: int = 0
+    ) -> None:
+        if version is None:
+            version = self.interface.version
+
+        self.version = version
+        self.dispatcher = Dispatcher(self.interface.requests, destructor=True)
+
+        if isinstance(client, Client):
+            client_ptr = client._ptr
+        else:
+            client_ptr = client
+        assert client_ptr is not None
+
+        self._ptr: ffi.WlResource | None = lib.wl_resource_create(
+            client_ptr, self.interface._ptr, version, id
+        )
+
+        self._handle: ffi.CData = ffi.new_handle(self)
+        lib.wl_resource_set_dispatcher(
+            self._ptr,
+            lib.dispatcher_func,
+            ffi.NULL,
+            self._handle,
+            lib.resource_destroy_func,
+        )
+
+    def destroy(self) -> None:
+        """Destroy the Resource"""
+        if self._ptr:
+            lib.wl_resource_destroy(self._ptr)
+            self._ptr = None
+
+    @ensure_valid
+    def get_id(self) -> int:
+        """Get the id of the Resource"""
+        assert self._ptr is not None
+        return lib.wl_resource_get_id(self._ptr)
+
+    @ensure_valid
+    def add_destroy_listener(self, listener: Listener) -> None:
+        """Add a listener for the destroy signal
+
+        :param listener: The listener object
+        :type listener: :class:`~pywayland.server.Listener`
+        """
+        assert self._ptr is not None and listener._ptr is not None
+        lib.wl_resource_add_destroy_listener(self._ptr, listener._ptr)
+
+    @ensure_valid
+    def _post_event(self, opcode: int, *args: Any) -> None:
+        assert self._ptr is not None
+        # Create wl_argument array
+        args_ptr = self.interface.events[opcode].arguments_to_c(*args)
+
+        # Write the event array to this object
+        resource: ffi.WlResource = ffi.cast("struct wl_resource *", self._ptr)
+        lib.wl_resource_post_event_array(resource, opcode, args_ptr)
+
+    @ensure_valid
+    def _post_error(self, code: int, msg: str = "") -> None:
+        assert self._ptr is not None
+        lib.wl_resource_post_error(self._ptr, code, msg.encode())

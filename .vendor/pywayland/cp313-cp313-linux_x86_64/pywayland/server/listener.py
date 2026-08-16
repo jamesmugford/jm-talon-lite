@@ -1,0 +1,150 @@
+# Copyright 2015 Sean Vig
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from logging import getLogger
+from typing import TYPE_CHECKING
+
+from pywayland import ffi, lib
+from pywayland.utils import wl_container_of
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any, ParamSpec, TypeVar
+
+    P = ParamSpec("P")
+    R = TypeVar("R")
+
+logger = getLogger(__package__)
+
+
+# void (*wl_notify_func_t)(struct wl_listener *listener, void *data);
+@ffi.def_extern()
+def notify_func(listener_ptr: ffi.WlListener, data: ffi.CData) -> None:
+    container: ffi.WlListenerContainer = wl_container_of(
+        listener_ptr, "struct wl_listener_container *", "destroy_listener"
+    )
+    listener = ffi.from_handle(container.handle)
+
+    if listener._signal is not None and listener._signal._data_wrapper is not None:
+        data = listener._signal._data_wrapper(data)
+
+    callback = listener._notify
+
+    try:
+        callback(listener, data)
+    except Exception:
+        logger.exception("Exception in callback function")
+
+
+class Listener:
+    """A single listener for Wayland signals
+
+    Provides the means to listen for `wl_listener` signal notifications.  Many
+    Wayland objects use `wl_listener` for notification of significant events
+    like object destruction.
+
+    Clients should create :class:`Listener` objects manually and can register
+    them as listeners to objects destroy events using the object's
+    ``.add_destroy_listener()`` method.  A listener can only listen to one
+    signal at a time.
+
+    :param function: callback function for the Listener
+    :type function: callable
+    """
+
+    def __init__(self, function: Callable[P, R]) -> None:
+        self._ptr: ffi.WlListener | None
+        self._handle: ffi.CData = ffi.new_handle(self)
+
+        # we need a way to get this Python object from the `struct
+        # wl_listener*`, so we put the pointer in a container struct that
+        # contains both the wl_listener and a pointer to our ffi handle
+        self.container: ffi.WlListenerContainer = ffi.new(
+            "struct wl_listener_container *"
+        )
+        self.container.handle = self._handle
+
+        self._ptr = ffi.addressof(self.container.destroy_listener)
+        self._ptr.notify = lib.notify_func  # type: ignore [assignment]
+        self._notify = function
+        self._signal: Signal | None = None
+
+    def remove(self) -> None:
+        """Remove the listener"""
+        if self._ptr and self._ptr.link != ffi.NULL:
+            lib.wl_list_remove(ffi.addressof(self._ptr.link))
+            self._ptr = None
+
+
+class Signal:
+    """A source of a type of observable event
+
+    Signals are recognized points where significant events can be observed.
+    Compositors as well as the server can provide signals. Observers are
+    wl_listener's that are added through #wl_signal_add. Signals are emitted
+    using #wl_signal_emit, which will invoke all listeners until that listener
+    is removed by wl_list_remove() (or whenever the signal is destroyed).
+    """
+
+    def __init__(
+        self,
+        *,
+        ptr: ffi.WlSignal | None = None,
+        data_wrapper: Callable[P, R] | None = None,
+    ) -> None:
+        if ptr is None:
+            self._ptr: ffi.WlSignal = ffi.new("struct wl_signal *")
+            lib.wl_signal_init(self._ptr)
+        else:
+            self._ptr = ptr
+
+        self._data_wrapper = data_wrapper
+        self._link: list[Listener] = []
+
+    def add(self, listener: Listener) -> None:
+        """Add the specified listener to this signal
+
+        :param listener: The listener to add
+        :type listener: :class:`Listener`
+        """
+        # we are creating a reference loop, as the listener resolves the data
+        # wrapper function, and the signal keeps the listener alive
+        listener._signal = self
+        self._link.append(listener)
+
+        if listener._ptr is not None:
+            lib.wl_signal_add(self._ptr, listener._ptr)
+
+    def emit(self, data: Any = None) -> None:
+        """Emits this signal, notifying all registered listeners
+
+        :param data: The data that will be emitted with the signal
+        """
+        data_ptr: ffi.CData
+        if data is not None:
+            data_ptr = ffi.new_handle(data)
+        else:
+            data_ptr = ffi.NULL
+        lib.wl_signal_emit(self._ptr, data_ptr)
+
+    def remove_listeners(self) -> None:
+        """Removes all listeners from this signal.
+
+        This can be useful when an object is about to be destroyed
+        and all listeners need to be removed from that object.
+        """
+        for listener in self._link[:]:
+            listener.remove()

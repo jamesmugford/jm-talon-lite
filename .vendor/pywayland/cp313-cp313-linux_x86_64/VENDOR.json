@@ -1,0 +1,42 @@
+{
+  "pywayland": {
+    "version": "0.4.19",
+    "commit": "7f48c575076b3e620a6ba3565dc877d3a9e665ff",
+    "wheel_sha256": "267e24092fefad19b0d8c4ca79ed11f9e6ab8074a4953d6dbbba1b180ec36363",
+    "source_sha256": "e44bc98b0e0d0b11e7f9f5c93045d5c80f9775237e7a5ae49a815e47b07ddca4",
+    "patch": "Expose wl_display_cancel_read and link the wheel-private Wayland libraries"
+  },
+  "wayland": {
+    "version": "1.26.0",
+    "tag": "1.26.0",
+    "commit": "87cc8a8728a923fc57938faa81ba0e74f34ecdc7"
+  },
+  "bundle": {
+    "target": "CPython 3.13, CFFI 1.17.1, Linux x86-64",
+    "minimum_glibc": "2.34",
+    "maximum_glibc": "2.34",
+    "extension_runpath": "$ORIGIN/../pywayland.libs",
+    "extension_needed": [
+      "libwayland-client-4c018dff.so.0.26.0",
+      "libwayland-server-2d5f7739.so.0.26.0"
+    ],
+    "private_libraries": [
+      "libffi-acf6d142.so.8.1.0",
+      "libwayland-client-4c018dff.so.0.26.0",
+      "libwayland-server-2d5f7739.so.0.26.0"
+    ],
+    "build_model": "Pinned source inputs reconstructed with the host GCC and Talon headers; not bit-for-bit reproducible"
+  },
+  "protocols": {
+    "wayland.xml": "cc860987e54f8d85c940e97fa1270c69b6e4ad31fbcf5a7f00107ce1157f5e07",
+    "wlr-virtual-pointer-unstable-v1.xml": "3ff6d540be0bc5228195bf072bde42117ea17945a5c2061add5d3cf97d6bb524",
+    "virtual-keyboard-unstable-v1.xml": "b4898f92c27db08c75bb82e9eeec5b179b80a4d6aeb34c26da60b485fca9c450",
+    "wlr-foreign-toplevel-management-unstable-v1.xml": "4ecc4588858e29fe680a33521e1f22bcf22071d66d1553fe96b4ddec03d591d2"
+  },
+  "generated_protocols": {
+    "wayland.py": "12b4f10759b0e032a6231e733725bff4a9b69a927d741f0d6fc6f7197265a8c9",
+    "virtual_keyboard_unstable_v1.py": "b5d207513ec4b4129f8b35c73a79f0114fb5b86d64867e625938ad40aab6a94b",
+    "wlr_foreign_toplevel_management_unstable_v1.py": "dadb583f4a08b72f4c1de613d4a01ab272386db3f96aba6207af6f36c5360e30",
+    "wlr_virtual_pointer_unstable_v1.py": "d452d0f5370b9c733ca382ee56d999ab2255ce888d30ae25a60034b4470995b9"
+  }
+}
