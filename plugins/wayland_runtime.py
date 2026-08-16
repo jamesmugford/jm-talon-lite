@@ -34,13 +34,19 @@ if _previous_context_job is not None:
     cron.cancel(_previous_context_job)
     delattr(sys, _CONTEXT_JOB_KEY)
 
-_app_scope_decl = scope.scopes["app"]
-_win_scope_decl = scope.scopes["win"]
+_app_scope_decl = None
+_win_scope_decl = None
 _scope_originals = getattr(sys, _SCOPE_ORIGINALS_KEY, None)
-if _scope_originals is None:
-    _scope_originals = (_app_scope_decl.func, _win_scope_decl.func)
-    setattr(sys, _SCOPE_ORIGINALS_KEY, _scope_originals)
-else:
+
+
+def _initialize_scope_declarations() -> None:
+    global _app_scope_decl, _scope_originals, _win_scope_decl
+    _app_scope_decl = scope.scopes["app"]
+    _win_scope_decl = scope.scopes["win"]
+    if _scope_originals is None:
+        _scope_originals = (_app_scope_decl.func, _win_scope_decl.func)
+        setattr(sys, _SCOPE_ORIGINALS_KEY, _scope_originals)
+        return
     _app_scope_decl.func, _win_scope_decl.func = _scope_originals
     _app_scope_decl.update()
     _win_scope_decl.update()
@@ -263,6 +269,7 @@ def _on_ready() -> None:
     if not _is_wayland():
         return
     try:
+        _initialize_scope_declarations()
         _runtime.start()
         if _has_toplevel_manager():
             _install_scope_providers()
