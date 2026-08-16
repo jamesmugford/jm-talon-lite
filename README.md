@@ -38,6 +38,13 @@ Current supported back ends
 * Dotool
 * _More can be added (Ideas and pull requests are welcome)_
 
+An experimental in-process Wayland runtime is included for Talon's CPython
+3.13 x86-64 build on Linux with glibc 2.34 or newer. It currently proves
+registry discovery and foreign-toplevel tracking only; it does not inject input
+or replace Dotool yet. Use the Talon actions `user.wayland_runtime_start()`,
+`user.wayland_runtime_status()`, and `user.wayland_runtime_stop()` to exercise
+it.
+
 
 ## Instuctions
 
@@ -69,6 +76,16 @@ Run minimal pure-function tests:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
 ```
+
+Rebuild the pinned PyWayland bundle and generated protocol bindings with:
+
+```sh
+python tools/build_pywayland_vendor.py
+```
+
+The build requires `~/.talon/bin/python`, GCC, binutils, Wayland development
+headers, and network access. See `third_party/README.md` for source, patch, and
+reconstruction details.
 
 
 Physical keyboard input recipes
