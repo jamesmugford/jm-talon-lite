@@ -39,11 +39,24 @@ Current supported back ends
 * _More can be added (Ideas and pull requests are welcome)_
 
 An experimental in-process Wayland runtime is included for Talon's CPython
-3.13 x86-64 build on Linux with glibc 2.34 or newer. It currently proves
-registry discovery and foreign-toplevel tracking only; it does not inject input
-or replace Dotool yet. Use the Talon actions `user.wayland_runtime_start()`,
-`user.wayland_runtime_status()`, and `user.wayland_runtime_stop()` to exercise
-it.
+3.13 x86-64 build on Linux with glibc 2.34 or newer. It currently supports
+registry discovery, foreign-toplevel tracking, seat selection, and manual
+virtual-pointer diagnostics; it does not replace Dotool yet. Use the Talon
+actions `user.wayland_runtime_start()`, `user.wayland_runtime_status()`, and
+`user.wayland_runtime_stop()` to exercise it. Pointer diagnostics require the
+compositor to advertise `zwlr_virtual_pointer_manager_v1`; after starting,
+wait for the status to show `virtual_pointer_ready=True` before using them.
+
+Pointer diagnostics clamp absolute coordinates to `0..1`, accept relative
+compositor-space deltas, and map Talon buttons `0`, `1`, and `2` to left,
+right, and middle. Positive vertical wheel steps scroll down:
+
+```python
+actions.user.wayland_pointer_move_absolute(0.5, 0.5)
+actions.user.wayland_pointer_move_relative(1, 0)
+actions.user.wayland_pointer_click(0)
+actions.user.wayland_pointer_scroll(vertical_steps=1)
+```
 
 
 ## Instuctions
@@ -71,7 +84,7 @@ dotoold will need to be run in the background, which can be started with e.g. sy
 
 ## Dev tests
 
-Run minimal pure-function tests:
+Run the unit and lightweight runtime tests:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v

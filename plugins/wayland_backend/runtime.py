@@ -1,17 +1,28 @@
-"""Single-owner-thread Wayland registry and toplevel runtime."""
+"""Single-owner-thread Wayland registry, toplevel, and virtual-input runtime."""
 
 from __future__ import annotations
 
 import errno
+import math
 import selectors
 import socket
 import struct
 import threading
+import time
 import traceback
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+
+from .pointer import (
+    POINTER_EXTENT,
+    linux_button_code,
+    normalized_to_extent,
+    validate_int32,
+    validate_wayland_fixed,
+)
 
 
 @dataclass(frozen=True)
@@ -23,10 +34,20 @@ class ToplevelSnapshot:
 
 
 @dataclass(frozen=True)
+class SeatSnapshot:
+    global_name: int
+    name: str
+    capabilities: tuple[str, ...]
+    selected: bool
+
+
+@dataclass(frozen=True)
 class RuntimeStatus:
     running: bool
     globals: tuple[tuple[str, int], ...]
     toplevels: tuple[ToplevelSnapshot, ...]
+    seats: tuple[SeatSnapshot, ...]
+    virtual_pointer_ready: bool
     error: str | None
 
 
@@ -38,12 +59,46 @@ class _PendingToplevel:
     states: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass
+class _Seat:
+    global_name: int
+    version: int
+    proxy: Any
+    name: str = ""
+    capabilities: int = 0
+
+
+@dataclass
+class _Command:
+    callback: Callable[[], Any]
+    done: threading.Event = field(default_factory=threading.Event)
+    # Transitions under _command_lock: queued -> claimed -> done,
+    # queued -> cancelled -> done, or queued -> done on failure or shutdown.
+    state: str = "queued"
+    result: Any = None
+    error: Exception | None = None
+
+
 _STATE_NAMES = {
     0: "maximized",
     1: "minimized",
     2: "activated",
     3: "fullscreen",
 }
+_SEAT_CAPABILITY_NAMES = {
+    1: "pointer",
+    2: "keyboard",
+    4: "touch",
+}
+_TOPLEVEL_MANAGER = "zwlr_foreign_toplevel_manager_v1"
+_VIRTUAL_POINTER_MANAGER = "zwlr_virtual_pointer_manager_v1"
+_SEAT_INTERFACE = "wl_seat"
+_AXIS_VERTICAL = 0
+_AXIS_HORIZONTAL = 1
+_AXIS_SOURCE_WHEEL = 0
+_BUTTON_RELEASED = 0
+_BUTTON_PRESSED = 1
+_SCROLL_DISTANCE_PER_STEP = 15.0
 
 
 def decode_toplevel_states(payload: bytes) -> tuple[str, ...]:
@@ -54,12 +109,23 @@ def decode_toplevel_states(payload: bytes) -> tuple[str, ...]:
     return tuple(_STATE_NAMES.get(value, f"unknown:{value}") for value in values)
 
 
+def _validate_timeout(timeout: float) -> float:
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise TypeError("Timeout must be a number")
+    if isinstance(timeout, float) and not math.isfinite(timeout):
+        raise ValueError("Timeout must be finite")
+    if timeout <= 0 or timeout > threading.TIMEOUT_MAX:
+        raise ValueError("Timeout must be positive and within threading.TIMEOUT_MAX")
+    return float(timeout)
+
+
 def _load_bindings() -> SimpleNamespace:
     from .vendor import activate
 
     activate()
     from pywayland import ffi, lib
     from pywayland.client import Display
+    from pywayland.protocol.wayland import WlSeat
     from pywayland.protocol.virtual_keyboard_unstable_v1 import (
         ZwpVirtualKeyboardManagerV1,
     )
@@ -81,6 +147,7 @@ def _load_bindings() -> SimpleNamespace:
             ZwlrForeignToplevelManagerV1.name: ZwlrForeignToplevelManagerV1,
             ZwlrVirtualPointerManagerV1.name: ZwlrVirtualPointerManagerV1,
             ZwpVirtualKeyboardManagerV1.name: ZwpVirtualKeyboardManagerV1,
+            WlSeat.name: WlSeat,
         },
     )
 
@@ -91,6 +158,7 @@ class WaylandRuntime:
     def __init__(self) -> None:
         self._lifecycle_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._command_lock = threading.Lock()
         self._ready = threading.Event()
         self._running = threading.Event()
         self._stopping = threading.Event()
@@ -103,14 +171,22 @@ class WaylandRuntime:
         self._handles: dict[Any, _PendingToplevel] = {}
         self._proxies: dict[str, tuple[int, Any]] = {}
         self._announced_globals: dict[int, tuple[str, int]] = {}
+        self._seats: dict[int, _Seat] = {}
+        self._selected_seat_global: int | None = None
+        self._virtual_pointer: Any = None
+        self._pressed_pointer_buttons: set[int] = set()
+        self._commands: deque[_Command] = deque()
         self._next_toplevel_id = 1
         self._bindings: SimpleNamespace | None = None
         self._display: Any = None
         self._registry: Any = None
         self._sync_callback: Any = None
+        self._initialized = False
+        self._owner_thread_id: int | None = None
 
     def start(self, timeout: float = 5.0) -> None:
         """Start the owner thread and wait for registry initialization."""
+        timeout = _validate_timeout(timeout)
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 ready = self._ready
@@ -123,10 +199,17 @@ class WaylandRuntime:
                     self._error = None
                     self._globals.clear()
                     self._snapshots.clear()
+                    self._seats.clear()
+                    self._selected_seat_global = None
+                    self._virtual_pointer = None
                 self._handles.clear()
                 self._proxies.clear()
                 self._announced_globals.clear()
+                self._pressed_pointer_buttons.clear()
+                with self._command_lock:
+                    self._commands.clear()
                 self._next_toplevel_id = 1
+                self._initialized = False
                 self._wake_read, self._wake_write = socket.socketpair()
                 self._wake_read.setblocking(False)
                 self._wake_write.setblocking(False)
@@ -150,12 +233,14 @@ class WaylandRuntime:
 
     def stop(self, timeout: float = 5.0) -> None:
         """Wake and join the owner thread. Safe to call more than once."""
+        timeout = _validate_timeout(timeout)
         with self._lifecycle_lock:
             thread = self._thread
             if thread is None:
                 self._close_wakeup()
                 return
             self._stopping.set()
+            self._fail_pending_commands(RuntimeError("Wayland runtime is stopping"))
             self._wake()
             if thread is not threading.current_thread():
                 thread.join(timeout)
@@ -173,8 +258,161 @@ class WaylandRuntime:
                 toplevels=tuple(
                     self._snapshots[key] for key in sorted(self._snapshots)
                 ),
+                seats=tuple(
+                    SeatSnapshot(
+                        global_name=seat.global_name,
+                        name=seat.name or f"global-{seat.global_name}",
+                        capabilities=tuple(
+                            capability_name
+                            for capability, capability_name in (
+                                _SEAT_CAPABILITY_NAMES.items()
+                            )
+                            if seat.capabilities & capability
+                        ),
+                        selected=seat.global_name == self._selected_seat_global,
+                    )
+                    for seat in sorted(
+                        self._seats.values(), key=lambda item: item.global_name
+                    )
+                ),
+                virtual_pointer_ready=self._virtual_pointer is not None,
                 error=self._error,
             )
+
+    def pointer_move_absolute(
+        self, x: float, y: float, timeout: float = 1.0
+    ) -> None:
+        """Move the virtual pointer to normalized desktop coordinates."""
+        x_value, y_value = normalized_to_extent(x, y)
+        self._submit(
+            lambda: self._emit_pointer_absolute(x_value, y_value),
+            timeout,
+        )
+
+    def pointer_move_relative(
+        self, dx: float, dy: float, timeout: float = 1.0
+    ) -> None:
+        """Move the virtual pointer by a relative compositor-space delta."""
+        dx = validate_wayland_fixed(dx, "Pointer x delta")
+        dy = validate_wayland_fixed(dy, "Pointer y delta")
+        self._submit(lambda: self._emit_pointer_relative(dx, dy), timeout)
+
+    def pointer_button_down(self, button: int = 0, timeout: float = 1.0) -> None:
+        """Press a supported Talon mouse button."""
+        button_code = linux_button_code(button)
+        self._submit(
+            lambda: self._emit_pointer_button(button_code, pressed=True),
+            timeout,
+        )
+
+    def pointer_button_up(self, button: int = 0, timeout: float = 1.0) -> None:
+        """Release a supported Talon mouse button."""
+        button_code = linux_button_code(button)
+        self._submit(
+            lambda: self._emit_pointer_button(button_code, pressed=False),
+            timeout,
+        )
+
+    def pointer_click(self, button: int = 0, timeout: float = 1.0) -> None:
+        """Press and release a supported Talon mouse button."""
+        button_code = linux_button_code(button)
+        self._submit(lambda: self._emit_pointer_click(button_code), timeout)
+
+    def pointer_scroll(
+        self,
+        vertical_steps: int = 0,
+        horizontal_steps: int = 0,
+        timeout: float = 1.0,
+    ) -> None:
+        """Emit discrete wheel steps; positive vertical values scroll down."""
+        vertical_steps = validate_int32(vertical_steps, "Vertical scroll steps")
+        horizontal_steps = validate_int32(horizontal_steps, "Horizontal scroll steps")
+        validate_wayland_fixed(
+            vertical_steps * _SCROLL_DISTANCE_PER_STEP,
+            "Vertical scroll distance",
+        )
+        validate_wayland_fixed(
+            horizontal_steps * _SCROLL_DISTANCE_PER_STEP,
+            "Horizontal scroll distance",
+        )
+        if vertical_steps == 0 and horizontal_steps == 0:
+            self._submit(self._require_virtual_pointer, timeout)
+            return
+        self._submit(
+            lambda: self._emit_pointer_scroll(vertical_steps, horizontal_steps),
+            timeout,
+        )
+
+    def _submit(self, callback: Callable[[], Any], timeout: float) -> Any:
+        timeout = _validate_timeout(timeout)
+        if not self._running.is_set() or self._stopping.is_set():
+            raise RuntimeError("Wayland runtime is not running")
+        if threading.get_ident() == self._owner_thread_id:
+            return callback()
+
+        command = _Command(callback)
+        with self._command_lock:
+            if not self._running.is_set() or self._stopping.is_set():
+                raise RuntimeError("Wayland runtime is not running")
+            self._commands.append(command)
+        self._wake()
+
+        if not command.done.wait(timeout):
+            with self._command_lock:
+                if command.state == "queued":
+                    command.state = "cancelled"
+                    cancelled = True
+                else:
+                    cancelled = False
+            if cancelled:
+                raise TimeoutError("Wayland command was cancelled before execution")
+            # Internal command callbacks only marshal nonblocking requests. Once
+            # claimed, wait for a definitive result rather than report a timeout
+            # while input may still be emitted.
+            command.done.wait()
+        if command.error is not None:
+            raise command.error
+        return command.result
+
+    def _drain_commands(self) -> None:
+        while True:
+            with self._command_lock:
+                if not self._commands:
+                    return
+                command = self._commands.popleft()
+                if command.state == "cancelled":
+                    cancelled = True
+                else:
+                    command.state = "claimed"
+                    cancelled = False
+            if cancelled:
+                command.done.set()
+                continue
+            if self._stopping.is_set():
+                command.error = RuntimeError("Wayland runtime is stopping")
+                with self._command_lock:
+                    command.state = "done"
+                command.done.set()
+                continue
+            try:
+                command.result = command.callback()
+            except Exception as exc:
+                command.error = exc
+            finally:
+                with self._command_lock:
+                    command.state = "done"
+                command.done.set()
+
+    def _fail_pending_commands(self, error: Exception) -> None:
+        with self._command_lock:
+            commands = tuple(self._commands)
+            self._commands.clear()
+            for command in commands:
+                if command.state == "queued":
+                    command.error = error
+                command.state = "done"
+        for command in commands:
+            command.done.set()
 
     def _close_wakeup(self) -> None:
         for sock in (self._wake_read, self._wake_write):
@@ -200,6 +438,7 @@ class WaylandRuntime:
                 self._error = f"{type(exc).__name__}: {exc}"
         self._stopping.set()
         self._ready.set()
+        self._fail_pending_commands(exc)
         self._wake()
 
     def _guard_callback(self, callback: Callable[..., None]) -> Callable[..., None]:
@@ -213,6 +452,7 @@ class WaylandRuntime:
         return guarded
 
     def _run(self) -> None:
+        self._owner_thread_id = threading.get_ident()
         try:
             self._bindings = _load_bindings()
             self._connect()
@@ -224,12 +464,14 @@ class WaylandRuntime:
         finally:
             self._running.clear()
             self._ready.set()
+            self._fail_pending_commands(RuntimeError("Wayland runtime stopped"))
             try:
                 self._disconnect()
             except Exception as exc:
                 self._record_failure(exc)
                 traceback.print_exc()
             finally:
+                self._owner_thread_id = None
                 self._close_wakeup()
 
     def _connect(self) -> None:
@@ -263,6 +505,9 @@ class WaylandRuntime:
     def _on_bindings_sync(self, callback: Any, _callback_data: int) -> None:
         callback._destroy()
         self._sync_callback = None
+        self._initialized = True
+        self._select_seat()
+        self._maybe_create_virtual_pointer()
         self._ready.set()
 
     def _on_global(
@@ -274,6 +519,9 @@ class WaylandRuntime:
             return
 
         self._announced_globals[name] = (interface_name, version)
+        if interface_name == _SEAT_INTERFACE:
+            self._bind_seat(registry, name, version)
+            return
         if interface_name in self._proxies:
             return
         self._bind_global(registry, name, interface_name, version)
@@ -289,17 +537,233 @@ class WaylandRuntime:
         with self._state_lock:
             self._globals[interface_name] = negotiated_version
 
-        if interface_name == "zwlr_foreign_toplevel_manager_v1":
+        if interface_name == _TOPLEVEL_MANAGER:
             proxy.dispatcher["toplevel"] = self._guard_callback(self._on_toplevel)
             proxy.dispatcher["finished"] = self._guard_callback(
                 self._on_toplevel_manager_finished
             )
+        elif interface_name == _VIRTUAL_POINTER_MANAGER:
+            self._maybe_create_virtual_pointer()
+
+    def _bind_seat(self, registry: Any, global_name: int, version: int) -> None:
+        assert self._bindings is not None
+        interface = self._bindings.interfaces[_SEAT_INTERFACE]
+        negotiated_version = min(version, interface.version)
+        proxy = registry.bind(global_name, interface, negotiated_version)
+        seat = _Seat(global_name, negotiated_version, proxy)
+        with self._state_lock:
+            self._seats[global_name] = seat
+            self._globals[_SEAT_INTERFACE] = max(
+                candidate.version for candidate in self._seats.values()
+            )
+
+        proxy.dispatcher["name"] = self._guard_callback(
+            lambda _proxy, value: self._on_seat_name(global_name, value)
+        )
+        proxy.dispatcher["capabilities"] = self._guard_callback(
+            lambda _proxy, value: self._on_seat_capabilities(global_name, value)
+        )
+        self._select_seat()
+
+    def _on_seat_name(self, global_name: int, name: str) -> None:
+        with self._state_lock:
+            seat = self._seats.get(global_name)
+            if seat is None:
+                return
+            seat.name = name
+        self._select_seat()
+
+    def _on_seat_capabilities(self, global_name: int, capabilities: int) -> None:
+        with self._state_lock:
+            seat = self._seats.get(global_name)
+            if seat is not None:
+                seat.capabilities = capabilities
+
+    def _select_seat(self) -> None:
+        with self._state_lock:
+            old_global = self._selected_seat_global
+            if self._seats:
+                # Prefer the conventional seat0, then the lowest registry ID.
+                selected = min(
+                    self._seats.values(),
+                    key=lambda seat: (seat.name != "seat0", seat.global_name),
+                )
+                new_global = selected.global_name
+            else:
+                new_global = None
+            self._selected_seat_global = new_global
+
+        if new_global != old_global:
+            self._destroy_virtual_pointer()
+            self._maybe_create_virtual_pointer()
+
+    def _remove_seat(self, global_name: int) -> None:
+        with self._state_lock:
+            seat = self._seats.pop(global_name, None)
+            was_selected = self._selected_seat_global == global_name
+            if self._seats:
+                self._globals[_SEAT_INTERFACE] = max(
+                    candidate.version for candidate in self._seats.values()
+                )
+            else:
+                self._globals.pop(_SEAT_INTERFACE, None)
+        if seat is None:
+            return
+        if was_selected:
+            self._destroy_virtual_pointer()
+        self._release_seat(seat)
+        self._select_seat()
+
+    @staticmethod
+    def _release_seat(seat: _Seat) -> None:
+        if seat.proxy.destroyed:
+            return
+        if seat.version >= 5:
+            seat.proxy.release()
+        else:
+            seat.proxy._destroy()
+
+    def _maybe_create_virtual_pointer(self) -> None:
+        if not self._initialized or self._stopping.is_set():
+            return
+        with self._state_lock:
+            if self._virtual_pointer is not None:
+                return
+            seat = self._seats.get(self._selected_seat_global)
+        manager_entry = self._proxies.get(_VIRTUAL_POINTER_MANAGER)
+        if manager_entry is None or seat is None:
+            return
+        pointer = manager_entry[1].create_virtual_pointer(seat.proxy)
+        with self._state_lock:
+            self._virtual_pointer = pointer
+
+    def _destroy_virtual_pointer(self) -> None:
+        with self._state_lock:
+            pointer = self._virtual_pointer
+            self._virtual_pointer = None
+        if pointer is None:
+            self._pressed_pointer_buttons.clear()
+            return
+        try:
+            try:
+                if not pointer.destroyed and self._pressed_pointer_buttons:
+                    timestamp = self._timestamp_ms()
+                    for button_code in sorted(self._pressed_pointer_buttons):
+                        pointer.button(timestamp, button_code, _BUTTON_RELEASED)
+                    pointer.frame()
+            except Exception as release_error:
+                try:
+                    if not pointer.destroyed:
+                        pointer.destroy()
+                except Exception as destroy_error:
+                    release_error.add_note(
+                        "Virtual pointer destroy also failed: "
+                        f"{type(destroy_error).__name__}: {destroy_error}"
+                    )
+                raise
+            if not pointer.destroyed:
+                pointer.destroy()
+        finally:
+            self._pressed_pointer_buttons.clear()
+
+    @staticmethod
+    def _timestamp_ms() -> int:
+        return (time.monotonic_ns() // 1_000_000) & 0xFFFFFFFF
+
+    def _require_virtual_pointer(self) -> Any:
+        with self._state_lock:
+            pointer = self._virtual_pointer
+        if pointer is None or pointer.destroyed:
+            raise RuntimeError("Wayland virtual pointer is not ready")
+        return pointer
+
+    def _emit_pointer_absolute(self, x: int, y: int) -> None:
+        pointer = self._require_virtual_pointer()
+        pointer.motion_absolute(
+            self._timestamp_ms(),
+            x,
+            y,
+            POINTER_EXTENT,
+            POINTER_EXTENT,
+        )
+        pointer.frame()
+
+    def _emit_pointer_relative(self, dx: float, dy: float) -> None:
+        dx = validate_wayland_fixed(dx, "Pointer x delta")
+        dy = validate_wayland_fixed(dy, "Pointer y delta")
+        pointer = self._require_virtual_pointer()
+        pointer.motion(self._timestamp_ms(), dx, dy)
+        pointer.frame()
+
+    def _emit_pointer_button(self, button_code: int, *, pressed: bool) -> None:
+        if pressed and button_code in self._pressed_pointer_buttons:
+            return
+        if not pressed and button_code not in self._pressed_pointer_buttons:
+            return
+        pointer = self._require_virtual_pointer()
+        pointer.button(
+            self._timestamp_ms(),
+            button_code,
+            _BUTTON_PRESSED if pressed else _BUTTON_RELEASED,
+        )
+        if pressed:
+            self._pressed_pointer_buttons.add(button_code)
+        else:
+            self._pressed_pointer_buttons.remove(button_code)
+        pointer.frame()
+
+    def _emit_pointer_click(self, button_code: int) -> None:
+        if button_code in self._pressed_pointer_buttons:
+            raise RuntimeError("Cannot click a pointer button that is already held")
+        pointer = self._require_virtual_pointer()
+        timestamp = self._timestamp_ms()
+        pointer.button(timestamp, button_code, _BUTTON_PRESSED)
+        self._pressed_pointer_buttons.add(button_code)
+        pointer.frame()
+        pointer.button(timestamp, button_code, _BUTTON_RELEASED)
+        self._pressed_pointer_buttons.remove(button_code)
+        pointer.frame()
+
+    def _emit_pointer_scroll(
+        self, vertical_steps: int, horizontal_steps: int
+    ) -> None:
+        vertical_steps = validate_int32(vertical_steps, "Vertical scroll steps")
+        horizontal_steps = validate_int32(horizontal_steps, "Horizontal scroll steps")
+        vertical_value = validate_wayland_fixed(
+            vertical_steps * _SCROLL_DISTANCE_PER_STEP,
+            "Vertical scroll distance",
+        )
+        horizontal_value = validate_wayland_fixed(
+            horizontal_steps * _SCROLL_DISTANCE_PER_STEP,
+            "Horizontal scroll distance",
+        )
+        pointer = self._require_virtual_pointer()
+        timestamp = self._timestamp_ms()
+        pointer.axis_source(_AXIS_SOURCE_WHEEL)
+        if vertical_steps:
+            pointer.axis_discrete(
+                timestamp,
+                _AXIS_VERTICAL,
+                vertical_value,
+                vertical_steps,
+            )
+        if horizontal_steps:
+            pointer.axis_discrete(
+                timestamp,
+                _AXIS_HORIZONTAL,
+                horizontal_value,
+                horizontal_steps,
+            )
+        pointer.frame()
 
     def _on_global_remove(self, registry: Any, name: int) -> None:
         announcement = self._announced_globals.pop(name, None)
         if announcement is None:
             return
         interface_name, _version = announcement
+        if interface_name == _SEAT_INTERFACE:
+            self._remove_seat(name)
+            return
         entry = self._proxies.get(interface_name)
         if entry is None or entry[0] != name:
             return
@@ -307,7 +771,9 @@ class WaylandRuntime:
         _global_name, proxy = self._proxies.pop(interface_name)
         with self._state_lock:
             self._globals.pop(interface_name, None)
-        if interface_name == "zwlr_foreign_toplevel_manager_v1":
+        if interface_name == _VIRTUAL_POINTER_MANAGER:
+            self._destroy_virtual_pointer()
+        if interface_name == _TOPLEVEL_MANAGER:
             for handle in tuple(self._handles):
                 if not handle.destroyed:
                     handle.destroy()
@@ -369,7 +835,7 @@ class WaylandRuntime:
             handle.destroy()
 
     def _on_toplevel_manager_finished(self, manager: Any) -> None:
-        interface_name = "zwlr_foreign_toplevel_manager_v1"
+        interface_name = _TOPLEVEL_MANAGER
         entry = self._proxies.get(interface_name)
         if entry is not None and entry[1] is manager:
             self._proxies.pop(interface_name, None)
@@ -391,9 +857,14 @@ class WaylandRuntime:
             selector.register(display_fd, selectors.EVENT_READ, "display")
 
             while not self._stopping.is_set():
+                self._drain_commands()
+                if self._stopping.is_set():
+                    break
                 while lib.wl_display_prepare_read(display._ptr) != 0:
                     display.dispatch(block=False)
 
+                # Every successful prepare_read must be paired with either
+                # read_events or cancel_read, including exceptional paths.
                 prepared = True
                 try:
                     events = selectors.EVENT_READ
@@ -445,10 +916,13 @@ class WaylandRuntime:
         if display is None:
             return
         try:
+            self._destroy_virtual_pointer()
             for handle in tuple(self._handles):
                 if not handle.destroyed:
                     handle.destroy()
-            manager_entry = self._proxies.get("zwlr_foreign_toplevel_manager_v1")
+            for seat in tuple(self._seats.values()):
+                self._release_seat(seat)
+            manager_entry = self._proxies.get(_TOPLEVEL_MANAGER)
             if manager_entry is not None and not manager_entry[1].destroyed:
                 manager_entry[1].stop()
             try:
@@ -465,6 +939,10 @@ class WaylandRuntime:
                 self._handles.clear()
                 self._proxies.clear()
                 self._announced_globals.clear()
+                self._initialized = False
                 with self._state_lock:
+                    self._seats.clear()
+                    self._selected_seat_global = None
+                    self._virtual_pointer = None
                     self._globals.clear()
                     self._snapshots.clear()
