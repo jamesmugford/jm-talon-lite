@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import math
+import os
 import selectors
 import socket
 import struct
@@ -16,6 +17,12 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
+from .keyboard import (
+    KEYMAP_FORMAT_XKB_V1,
+    create_keymap_fd,
+    read_keymap_fd,
+    validate_keycode,
+)
 from .pointer import (
     POINTER_EXTENT,
     linux_button_code,
@@ -48,6 +55,7 @@ class RuntimeStatus:
     toplevels: tuple[ToplevelSnapshot, ...]
     seats: tuple[SeatSnapshot, ...]
     virtual_pointer_ready: bool
+    virtual_keyboard_ready: bool
     error: str | None
 
 
@@ -66,6 +74,8 @@ class _Seat:
     proxy: Any
     name: str = ""
     capabilities: int = 0
+    keyboard: Any = None
+    keymap: bytes | None = None
 
 
 @dataclass
@@ -92,13 +102,18 @@ _SEAT_CAPABILITY_NAMES = {
 }
 _TOPLEVEL_MANAGER = "zwlr_foreign_toplevel_manager_v1"
 _VIRTUAL_POINTER_MANAGER = "zwlr_virtual_pointer_manager_v1"
+_VIRTUAL_KEYBOARD_MANAGER = "zwp_virtual_keyboard_manager_v1"
 _SEAT_INTERFACE = "wl_seat"
+_SEAT_CAPABILITY_KEYBOARD = 2
 _AXIS_VERTICAL = 0
 _AXIS_HORIZONTAL = 1
 _AXIS_SOURCE_WHEEL = 0
 _BUTTON_RELEASED = 0
 _BUTTON_PRESSED = 1
+_KEY_RELEASED = 0
+_KEY_PRESSED = 1
 _SCROLL_DISTANCE_PER_STEP = 15.0
+_DISCONNECT_FLUSH_TIMEOUT = 0.25
 
 
 def decode_toplevel_states(payload: bytes) -> tuple[str, ...]:
@@ -175,6 +190,9 @@ class WaylandRuntime:
         self._selected_seat_global: int | None = None
         self._virtual_pointer: Any = None
         self._pressed_pointer_buttons: set[int] = set()
+        self._virtual_keyboard: Any = None
+        self._virtual_keyboard_keymap: bytes | None = None
+        self._pressed_keyboard_keys: list[int] = []
         self._commands: deque[_Command] = deque()
         self._next_toplevel_id = 1
         self._bindings: SimpleNamespace | None = None
@@ -202,10 +220,13 @@ class WaylandRuntime:
                     self._seats.clear()
                     self._selected_seat_global = None
                     self._virtual_pointer = None
+                    self._virtual_keyboard = None
+                    self._virtual_keyboard_keymap = None
                 self._handles.clear()
                 self._proxies.clear()
                 self._announced_globals.clear()
                 self._pressed_pointer_buttons.clear()
+                self._pressed_keyboard_keys.clear()
                 with self._command_lock:
                     self._commands.clear()
                 self._next_toplevel_id = 1
@@ -276,6 +297,10 @@ class WaylandRuntime:
                     )
                 ),
                 virtual_pointer_ready=self._virtual_pointer is not None,
+                virtual_keyboard_ready=(
+                    self._virtual_keyboard is not None
+                    and self._virtual_keyboard_keymap is not None
+                ),
                 error=self._error,
             )
 
@@ -342,6 +367,21 @@ class WaylandRuntime:
             lambda: self._emit_pointer_scroll(vertical_steps, horizontal_steps),
             timeout,
         )
+
+    def keyboard_key_down(self, keycode: int, timeout: float = 1.0) -> None:
+        """Press a Linux evdev keycode with the staged virtual keyboard."""
+        keycode = validate_keycode(keycode)
+        self._submit(lambda: self._emit_keyboard_key(keycode, pressed=True), timeout)
+
+    def keyboard_key_up(self, keycode: int, timeout: float = 1.0) -> None:
+        """Release a Linux evdev keycode with the staged virtual keyboard."""
+        keycode = validate_keycode(keycode)
+        self._submit(lambda: self._emit_keyboard_key(keycode, pressed=False), timeout)
+
+    def keyboard_key_tap(self, keycode: int, timeout: float = 1.0) -> None:
+        """Press and release a Linux evdev keycode."""
+        keycode = validate_keycode(keycode)
+        self._submit(lambda: self._emit_keyboard_tap(keycode), timeout)
 
     def _submit(self, callback: Callable[[], Any], timeout: float) -> Any:
         timeout = _validate_timeout(timeout)
@@ -507,7 +547,9 @@ class WaylandRuntime:
         self._sync_callback = None
         self._initialized = True
         self._select_seat()
+        self._maybe_create_selected_seat_keyboard()
         self._maybe_create_virtual_pointer()
+        self._maybe_create_virtual_keyboard()
         self._ready.set()
 
     def _on_global(
@@ -544,6 +586,8 @@ class WaylandRuntime:
             )
         elif interface_name == _VIRTUAL_POINTER_MANAGER:
             self._maybe_create_virtual_pointer()
+        elif interface_name == _VIRTUAL_KEYBOARD_MANAGER:
+            self._maybe_create_virtual_keyboard()
 
     def _bind_seat(self, registry: Any, global_name: int, version: int) -> None:
         assert self._bindings is not None
@@ -576,12 +620,24 @@ class WaylandRuntime:
     def _on_seat_capabilities(self, global_name: int, capabilities: int) -> None:
         with self._state_lock:
             seat = self._seats.get(global_name)
-            if seat is not None:
-                seat.capabilities = capabilities
+            if seat is None:
+                return
+            had_keyboard = bool(seat.capabilities & _SEAT_CAPABILITY_KEYBOARD)
+            has_keyboard = bool(capabilities & _SEAT_CAPABILITY_KEYBOARD)
+            seat.capabilities = capabilities
+            selected = global_name == self._selected_seat_global
+        if not selected or had_keyboard == has_keyboard:
+            return
+        if has_keyboard:
+            self._maybe_create_selected_seat_keyboard()
+            return
+        self._destroy_virtual_keyboard()
+        self._release_seat_keyboard(seat)
 
     def _select_seat(self) -> None:
         with self._state_lock:
             old_global = self._selected_seat_global
+            old_seat = self._seats.get(old_global)
             if self._seats:
                 # Prefer the conventional seat0, then the lowest registry ID.
                 selected = min(
@@ -594,8 +650,13 @@ class WaylandRuntime:
             self._selected_seat_global = new_global
 
         if new_global != old_global:
+            self._destroy_virtual_keyboard()
             self._destroy_virtual_pointer()
+            if old_seat is not None:
+                self._release_seat_keyboard(old_seat)
+            self._maybe_create_selected_seat_keyboard()
             self._maybe_create_virtual_pointer()
+            self._maybe_create_virtual_keyboard()
 
     def _remove_seat(self, global_name: int) -> None:
         with self._state_lock:
@@ -610,7 +671,9 @@ class WaylandRuntime:
         if seat is None:
             return
         if was_selected:
+            self._destroy_virtual_keyboard()
             self._destroy_virtual_pointer()
+        self._release_seat_keyboard(seat)
         self._release_seat(seat)
         self._select_seat()
 
@@ -622,6 +685,173 @@ class WaylandRuntime:
             seat.proxy.release()
         else:
             seat.proxy._destroy()
+
+    def _maybe_create_selected_seat_keyboard(self) -> None:
+        if not self._initialized or self._stopping.is_set():
+            return
+        with self._state_lock:
+            seat = self._seats.get(self._selected_seat_global)
+            if (
+                seat is None
+                or not seat.capabilities & _SEAT_CAPABILITY_KEYBOARD
+                or seat.keyboard is not None
+            ):
+                return
+        keyboard = seat.proxy.get_keyboard()
+        with self._state_lock:
+            seat.keyboard = keyboard
+            seat.keymap = None
+        keyboard.dispatcher["keymap"] = self._guard_callback(
+            lambda source, format, fd, size: self._on_seat_keymap(
+                seat.global_name,
+                source,
+                format,
+                fd,
+                size,
+            )
+        )
+    def _release_seat_keyboard(self, seat: _Seat) -> None:
+        with self._state_lock:
+            keyboard = seat.keyboard
+            seat.keyboard = None
+            seat.keymap = None
+        if keyboard is None or keyboard.destroyed:
+            return
+        if seat.version >= 3:
+            keyboard.release()
+        else:
+            keyboard._destroy()
+
+    def _on_seat_keymap(
+        self,
+        global_name: int,
+        source: Any,
+        format: int,
+        fd: int,
+        size: int,
+    ) -> None:
+        with self._state_lock:
+            seat = self._seats.get(global_name)
+            current = seat is not None and seat.keyboard is source
+        if not current or self._stopping.is_set():
+            if fd >= 0:
+                os.close(fd)
+            return
+        if format != KEYMAP_FORMAT_XKB_V1:
+            if fd >= 0:
+                os.close(fd)
+            with self._state_lock:
+                if seat.keyboard is not source:
+                    return
+                seat.keymap = None
+                selected = global_name == self._selected_seat_global
+            if selected:
+                self._destroy_virtual_keyboard()
+            return
+
+        keymap = read_keymap_fd(fd, size)
+        with self._state_lock:
+            if seat.keyboard is not source:
+                return
+            unchanged = seat.keymap == keymap
+            seat.keymap = keymap
+            selected = global_name == self._selected_seat_global
+            virtual_keyboard = self._virtual_keyboard
+        if not selected:
+            return
+        if unchanged:
+            self._maybe_create_virtual_keyboard()
+            return
+        if virtual_keyboard is None:
+            self._maybe_create_virtual_keyboard()
+            return
+        self._apply_virtual_keyboard_keymap(seat, virtual_keyboard)
+
+    def _maybe_create_virtual_keyboard(self) -> None:
+        if not self._initialized or self._stopping.is_set():
+            return
+        with self._state_lock:
+            if self._virtual_keyboard is not None:
+                return
+            seat = self._seats.get(self._selected_seat_global)
+            if (
+                seat is None
+                or seat.keyboard is None
+                or seat.keyboard.destroyed
+                or seat.keymap is None
+            ):
+                return
+        manager_entry = self._proxies.get(_VIRTUAL_KEYBOARD_MANAGER)
+        if manager_entry is None:
+            return
+        keyboard = manager_entry[1].create_virtual_keyboard(seat.proxy)
+        with self._state_lock:
+            self._virtual_keyboard = keyboard
+            self._virtual_keyboard_keymap = None
+        try:
+            self._apply_virtual_keyboard_keymap(seat, keyboard)
+        except Exception:
+            with self._state_lock:
+                if self._virtual_keyboard is keyboard:
+                    self._virtual_keyboard = None
+                    self._virtual_keyboard_keymap = None
+            if not keyboard.destroyed:
+                keyboard.destroy()
+            raise
+
+    def _apply_virtual_keyboard_keymap(self, seat: _Seat, keyboard: Any) -> None:
+        keymap = seat.keymap
+        if keymap is None:
+            raise RuntimeError("Selected Wayland seat has no XKB-v1 keymap")
+        with self._state_lock:
+            if (
+                self._virtual_keyboard is not keyboard
+                or self._virtual_keyboard_keymap == keymap
+            ):
+                return
+            self._virtual_keyboard_keymap = None
+        self._release_pressed_keyboard_keys(keyboard)
+        fd = create_keymap_fd(keymap)
+        try:
+            keyboard.keymap(KEYMAP_FORMAT_XKB_V1, fd, len(keymap))
+        finally:
+            os.close(fd)
+        with self._state_lock:
+            if self._virtual_keyboard is keyboard:
+                self._virtual_keyboard_keymap = keymap
+
+    def _release_pressed_keyboard_keys(self, keyboard: Any) -> None:
+        timestamp = self._timestamp_ms()
+        for keycode in reversed(tuple(self._pressed_keyboard_keys)):
+            keyboard.key(timestamp, keycode, _KEY_RELEASED)
+            self._pressed_keyboard_keys.remove(keycode)
+
+    def _destroy_virtual_keyboard(self) -> None:
+        with self._state_lock:
+            keyboard = self._virtual_keyboard
+            self._virtual_keyboard = None
+            self._virtual_keyboard_keymap = None
+        if keyboard is None:
+            self._pressed_keyboard_keys.clear()
+            return
+        try:
+            try:
+                if not keyboard.destroyed:
+                    self._release_pressed_keyboard_keys(keyboard)
+            except Exception as release_error:
+                try:
+                    if not keyboard.destroyed:
+                        keyboard.destroy()
+                except Exception as destroy_error:
+                    release_error.add_note(
+                        "Virtual keyboard destroy also failed: "
+                        f"{type(destroy_error).__name__}: {destroy_error}"
+                    )
+                raise
+            if not keyboard.destroyed:
+                keyboard.destroy()
+        finally:
+            self._pressed_keyboard_keys.clear()
 
     def _maybe_create_virtual_pointer(self) -> None:
         if not self._initialized or self._stopping.is_set():
@@ -669,6 +899,51 @@ class WaylandRuntime:
     @staticmethod
     def _timestamp_ms() -> int:
         return (time.monotonic_ns() // 1_000_000) & 0xFFFFFFFF
+
+    def _require_virtual_keyboard(self) -> Any:
+        with self._state_lock:
+            keyboard = self._virtual_keyboard
+            keymap = self._virtual_keyboard_keymap
+            seat = self._seats.get(self._selected_seat_global)
+            ready = (
+                keyboard is not None
+                and keymap is not None
+                and seat is not None
+                and seat.keyboard is not None
+                and not seat.keyboard.destroyed
+                and seat.keymap == keymap
+            )
+        if not ready or keyboard.destroyed:
+            raise RuntimeError("Wayland virtual keyboard is not ready")
+        return keyboard
+
+    def _emit_keyboard_key(self, keycode: int, *, pressed: bool) -> None:
+        keycode = validate_keycode(keycode)
+        keyboard = self._require_virtual_keyboard()
+        if pressed and keycode in self._pressed_keyboard_keys:
+            return
+        if not pressed and keycode not in self._pressed_keyboard_keys:
+            return
+        keyboard.key(
+            self._timestamp_ms(),
+            keycode,
+            _KEY_PRESSED if pressed else _KEY_RELEASED,
+        )
+        if pressed:
+            self._pressed_keyboard_keys.append(keycode)
+        else:
+            self._pressed_keyboard_keys.remove(keycode)
+
+    def _emit_keyboard_tap(self, keycode: int) -> None:
+        keycode = validate_keycode(keycode)
+        if keycode in self._pressed_keyboard_keys:
+            raise RuntimeError("Cannot tap a keyboard key that is already held")
+        keyboard = self._require_virtual_keyboard()
+        timestamp = self._timestamp_ms()
+        keyboard.key(timestamp, keycode, _KEY_PRESSED)
+        self._pressed_keyboard_keys.append(keycode)
+        keyboard.key(timestamp, keycode, _KEY_RELEASED)
+        self._pressed_keyboard_keys.remove(keycode)
 
     def _require_virtual_pointer(self) -> Any:
         with self._state_lock:
@@ -773,6 +1048,8 @@ class WaylandRuntime:
             self._globals.pop(interface_name, None)
         if interface_name == _VIRTUAL_POINTER_MANAGER:
             self._destroy_virtual_pointer()
+        if interface_name == _VIRTUAL_KEYBOARD_MANAGER:
+            self._destroy_virtual_keyboard()
         if interface_name == _TOPLEVEL_MANAGER:
             for handle in tuple(self._handles):
                 if not handle.destroyed:
@@ -911,27 +1188,63 @@ class WaylandRuntime:
             except BlockingIOError:
                 return
 
+    def _flush_for_disconnect(self) -> None:
+        assert self._display is not None
+        display = self._display
+        bindings = self._bindings
+        deadline = time.monotonic() + _DISCONNECT_FLUSH_TIMEOUT
+        while display.flush() == -1:
+            if bindings is None:
+                raise RuntimeError("Wayland bindings are unavailable during shutdown")
+            if bindings.ffi.errno != errno.EAGAIN:
+                raise OSError(
+                    bindings.ffi.errno,
+                    "wl_display_flush failed during shutdown",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out flushing Wayland shutdown requests")
+            with selectors.DefaultSelector() as selector:
+                selector.register(display.get_fd(), selectors.EVENT_WRITE)
+                if not selector.select(remaining):
+                    raise TimeoutError(
+                        "Timed out flushing Wayland shutdown requests"
+                    )
+
     def _disconnect(self) -> None:
         display = self._display
         if display is None:
             return
+
+        failures: list[tuple[str, Exception]] = []
+
+        def attempt(label: str, operation: Callable[[], Any]) -> None:
+            try:
+                operation()
+            except Exception as exc:
+                failures.append((label, exc))
+
         try:
-            self._destroy_virtual_pointer()
+            attempt("virtual keyboard cleanup", self._destroy_virtual_keyboard)
+            attempt("virtual pointer cleanup", self._destroy_virtual_pointer)
             for handle in tuple(self._handles):
                 if not handle.destroyed:
-                    handle.destroy()
+                    attempt("toplevel handle cleanup", handle.destroy)
             for seat in tuple(self._seats.values()):
-                self._release_seat(seat)
+                attempt(
+                    "seat keyboard cleanup",
+                    lambda seat=seat: self._release_seat_keyboard(seat),
+                )
+                attempt("seat cleanup", lambda seat=seat: self._release_seat(seat))
             manager_entry = self._proxies.get(_TOPLEVEL_MANAGER)
             if manager_entry is not None and not manager_entry[1].destroyed:
-                manager_entry[1].stop()
-            try:
-                display.flush()
-            except Exception:
-                pass
+                attempt("toplevel manager cleanup", manager_entry[1].stop)
+            attempt("shutdown flush", self._flush_for_disconnect)
         finally:
             try:
                 display.disconnect()
+            except Exception as exc:
+                failures.append(("display disconnect", exc))
             finally:
                 self._display = None
                 self._registry = None
@@ -944,5 +1257,16 @@ class WaylandRuntime:
                     self._seats.clear()
                     self._selected_seat_global = None
                     self._virtual_pointer = None
+                    self._virtual_keyboard = None
+                    self._virtual_keyboard_keymap = None
                     self._globals.clear()
                     self._snapshots.clear()
+                self._pressed_keyboard_keys.clear()
+
+        if failures:
+            _label, error = failures[0]
+            for label, secondary in failures[1:]:
+                error.add_note(
+                    f"{label} also failed: {type(secondary).__name__}: {secondary}"
+                )
+            raise error.with_traceback(error.__traceback__)

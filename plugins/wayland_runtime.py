@@ -19,7 +19,7 @@ setattr(sys, _RUNTIME_KEY, _runtime)
 @mod.action_class
 class Actions:
     def wayland_runtime_start() -> None:
-        """Start staged Wayland discovery and pointer diagnostics."""
+        """Start staged Wayland discovery and virtual-input diagnostics."""
         _runtime.start()
         print(f"Wayland runtime started: {_runtime.status()}")
 
@@ -57,3 +57,15 @@ class Actions:
     ) -> None:
         """Scroll discrete steps with the staged virtual pointer."""
         _runtime.pointer_scroll(vertical_steps, horizontal_steps)
+
+    def wayland_keyboard_key_down(keycode: int) -> None:
+        """Press a raw Linux evdev keycode with the staged keyboard."""
+        _runtime.keyboard_key_down(keycode)
+
+    def wayland_keyboard_key_up(keycode: int) -> None:
+        """Release a raw Linux evdev keycode with the staged keyboard."""
+        _runtime.keyboard_key_up(keycode)
+
+    def wayland_keyboard_key_tap(keycode: int) -> None:
+        """Tap a raw Linux evdev keycode with the staged keyboard."""
+        _runtime.keyboard_key_tap(keycode)

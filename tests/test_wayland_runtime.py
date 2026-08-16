@@ -1,8 +1,10 @@
 import errno
 import math
+import os
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -90,6 +92,7 @@ class _FakeDisplay:
         self.flush_results = list(flush_results or [0])
         self.callbacks = []
         self.dispatch_count = 0
+        self.flush_count = 0
         self.disconnected = False
 
     def connect(self):
@@ -107,6 +110,7 @@ class _FakeDisplay:
         return self.file_descriptor
 
     def flush(self):
+        self.flush_count += 1
         if len(self.flush_results) > 1:
             return self.flush_results.pop(0)
         return self.flush_results[0]
@@ -124,6 +128,8 @@ class _FakeProxy:
         self.dispatcher = {}
         self.calls = []
         self.created_pointers = []
+        self.created_keyboards = []
+        self.created_virtual_keyboards = []
         self.event_log = event_log
 
     def _record(self, call):
@@ -148,6 +154,27 @@ class _FakeProxy:
         self._record(("create_virtual_pointer", seat))
         self.created_pointers.append(pointer)
         return pointer
+
+    def get_keyboard(self):
+        keyboard = _FakeProxy(self.event_log)
+        self._record(("get_keyboard",))
+        self.created_keyboards.append(keyboard)
+        return keyboard
+
+    def create_virtual_keyboard(self, seat):
+        keyboard = _FakeProxy(self.event_log)
+        self._record(("create_virtual_keyboard", seat))
+        self.created_virtual_keyboards.append(keyboard)
+        return keyboard
+
+    def keymap(self, format, fd, size):
+        self._record(("keymap", format, os.pread(fd, size, 0), size))
+
+    def key(self, timestamp, keycode, state):
+        self._record(("key", timestamp, keycode, state))
+
+    def modifiers(self, depressed, latched, locked, group):
+        self._record(("modifiers", depressed, latched, locked, group))
 
     def motion_absolute(self, timestamp, x, y, x_extent, y_extent):
         self._record(
@@ -190,6 +217,24 @@ class WaylandRuntimeTests(unittest.TestCase):
                 "zwlr_virtual_pointer_manager_v1": SimpleNamespace(version=2),
             }
         )
+
+    @staticmethod
+    def _keyboard_bindings():
+        return SimpleNamespace(
+            interfaces={
+                "wl_seat": SimpleNamespace(version=11),
+                "zwp_virtual_keyboard_manager_v1": SimpleNamespace(version=1),
+            }
+        )
+
+    @staticmethod
+    def _send_keymap(source, data=b"xkb_keymap {}\n\0", format=1):
+        with tempfile.TemporaryFile() as keymap_file:
+            keymap_file.write(data)
+            keymap_file.flush()
+            fd = os.dup(keymap_file.fileno())
+        source.dispatcher["keymap"](source, format, fd, len(data))
+        return fd
 
     def test_connect_retains_registry_proxy(self):
         runtime = WaylandRuntime()
@@ -354,6 +399,32 @@ class WaylandRuntimeTests(unittest.TestCase):
             registry.event_log.index((seat, "release")),
         )
 
+    def test_disconnect_continues_cleanup_after_keyboard_release_failure(self):
+        runtime = WaylandRuntime()
+        display = _FakeDisplay()
+        keyboard = _FakeProxy()
+        pointer = _FakeProxy()
+        runtime._display = display
+        runtime._virtual_keyboard = keyboard
+        runtime._virtual_keyboard_keymap = b"xkb_keymap {}\n\0"
+        runtime._pressed_keyboard_keys.append(30)
+        runtime._virtual_pointer = pointer
+
+        with patch.object(
+            keyboard,
+            "key",
+            side_effect=RuntimeError("key release failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "key release failed"):
+                runtime._disconnect()
+
+        self.assertTrue(keyboard.destroyed)
+        self.assertTrue(pointer.destroyed)
+        self.assertEqual(display.flush_count, 1)
+        self.assertTrue(display.disconnected)
+        self.assertIsNone(runtime._display)
+        self.assertEqual(runtime._pressed_keyboard_keys, [])
+
     def test_old_seat_version_is_destroyed_without_release_request(self):
         runtime = WaylandRuntime()
         runtime._bindings = self._input_bindings()
@@ -366,6 +437,278 @@ class WaylandRuntimeTests(unittest.TestCase):
         self.assertIn(("_destroy",), seat.calls)
         self.assertNotIn(("release",), seat.calls)
         self.assertEqual(runtime.status().seats, ())
+
+    def test_keyboard_waits_for_selected_seat_keymap(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = self._keyboard_bindings()
+        runtime._initialized = True
+        registry = _FakeRegistry()
+
+        runtime._on_global(
+            registry, 10, "zwp_virtual_keyboard_manager_v1", 1
+        )
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[1][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        source = seat.created_keyboards[0]
+        manager = registry.bound[0][3]
+
+        self.assertFalse(runtime.status().virtual_keyboard_ready)
+        self.assertEqual(manager.created_virtual_keyboards, [])
+        self.assertNotIn("modifiers", source.dispatcher)
+
+        fd = self._send_keymap(source)
+
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+        keyboard = manager.created_virtual_keyboards[0]
+        self.assertEqual(
+            keyboard.calls,
+            [("keymap", 1, b"xkb_keymap {}\n\0", 15)],
+        )
+        self.assertTrue(runtime.status().virtual_keyboard_ready)
+
+    def test_cached_keymap_is_applied_when_keyboard_manager_arrives(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = self._keyboard_bindings()
+        runtime._initialized = True
+        registry = _FakeRegistry()
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[0][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        source = seat.created_keyboards[0]
+        self._send_keymap(source)
+
+        self.assertFalse(runtime.status().virtual_keyboard_ready)
+
+        runtime._on_global(
+            registry, 10, "zwp_virtual_keyboard_manager_v1", 1
+        )
+
+        manager = registry.bound[1][3]
+        self.assertEqual(len(manager.created_virtual_keyboards), 1)
+        self.assertTrue(runtime.status().virtual_keyboard_ready)
+
+    def test_keymap_updates_release_held_keys_and_suppress_exact_echoes(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = self._keyboard_bindings()
+        runtime._initialized = True
+        registry = _FakeRegistry()
+        runtime._on_global(
+            registry, 10, "zwp_virtual_keyboard_manager_v1", 1
+        )
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[1][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        source = seat.created_keyboards[0]
+        self._send_keymap(source)
+        keyboard = registry.bound[0][3].created_virtual_keyboards[0]
+        runtime._running.set()
+        runtime._owner_thread_id = threading.get_ident()
+
+        self._send_keymap(source)
+        self.assertEqual(
+            [call for call in keyboard.calls if call[0] == "keymap"],
+            [("keymap", 1, b"xkb_keymap {}\n\0", 15)],
+        )
+
+        with patch(
+            "wayland_backend.runtime.time.monotonic_ns",
+            return_value=9_000_000,
+        ):
+            runtime.keyboard_key_down(29)
+            self._send_keymap(source, b"xkb_keymap { updated };\n\0")
+
+        self.assertEqual(
+            keyboard.calls[-3:],
+            [
+                ("key", 9, 29, 1),
+                ("key", 9, 29, 0),
+                ("keymap", 1, b"xkb_keymap { updated };\n\0", 25),
+            ],
+        )
+        self.assertEqual(runtime._pressed_keyboard_keys, [])
+        self.assertTrue(runtime.status().virtual_keyboard_ready)
+
+    def test_keyboard_capability_loss_destroys_children_before_source(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = self._keyboard_bindings()
+        runtime._initialized = True
+        registry = _FakeRegistry()
+        runtime._on_global(
+            registry, 10, "zwp_virtual_keyboard_manager_v1", 1
+        )
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[1][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        source = seat.created_keyboards[0]
+        self._send_keymap(source)
+        keyboard = registry.bound[0][3].created_virtual_keyboards[0]
+        registry.event_log.clear()
+
+        seat.dispatcher["capabilities"](seat, 0)
+
+        self.assertLess(
+            registry.event_log.index((keyboard, "destroy")),
+            registry.event_log.index((source, "release")),
+        )
+        self.assertFalse(runtime.status().virtual_keyboard_ready)
+
+        seat.dispatcher["capabilities"](seat, 2)
+        self.assertEqual(len(seat.created_keyboards), 2)
+
+    def test_keyboard_manager_replacement_reuses_cached_keymap(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = self._keyboard_bindings()
+        runtime._initialized = True
+        registry = _FakeRegistry()
+        runtime._on_global(
+            registry, 10, "zwp_virtual_keyboard_manager_v1", 1
+        )
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[1][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        source = seat.created_keyboards[0]
+        self._send_keymap(source)
+        first_manager = registry.bound[0][3]
+        first_keyboard = first_manager.created_virtual_keyboards[0]
+
+        runtime._on_global_remove(registry, 10)
+
+        self.assertTrue(first_keyboard.destroyed)
+        self.assertFalse(source.destroyed)
+        self.assertFalse(runtime.status().virtual_keyboard_ready)
+
+        runtime._on_global(
+            registry, 11, "zwp_virtual_keyboard_manager_v1", 1
+        )
+
+        second_manager = registry.bound[-1][3]
+        self.assertEqual(len(second_manager.created_virtual_keyboards), 1)
+        self.assertTrue(runtime.status().virtual_keyboard_ready)
+
+    def test_unsupported_keymap_disables_keyboard_and_closes_fd(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = self._keyboard_bindings()
+        runtime._initialized = True
+        registry = _FakeRegistry()
+        runtime._on_global(
+            registry, 10, "zwp_virtual_keyboard_manager_v1", 1
+        )
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[1][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        source = seat.created_keyboards[0]
+        self._send_keymap(source)
+        keyboard = registry.bound[0][3].created_virtual_keyboards[0]
+
+        fd = self._send_keymap(source, format=0)
+
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+        self.assertTrue(keyboard.destroyed)
+        self.assertFalse(runtime.status().virtual_keyboard_ready)
+
+    def test_old_keyboard_version_is_destroyed_without_release_request(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = SimpleNamespace(
+            interfaces={"wl_seat": SimpleNamespace(version=2)}
+        )
+        runtime._initialized = True
+        registry = _FakeRegistry()
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[0][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        source = seat.created_keyboards[0]
+
+        seat.dispatcher["capabilities"](seat, 0)
+
+        self.assertIn(("_destroy",), source.calls)
+        self.assertNotIn(("release",), source.calls)
+
+    def test_keyboard_requests_and_teardown_preserve_key_order(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = self._keyboard_bindings()
+        runtime._initialized = True
+        registry = _FakeRegistry()
+        runtime._on_global(
+            registry, 10, "zwp_virtual_keyboard_manager_v1", 1
+        )
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[1][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        self._send_keymap(seat.created_keyboards[0])
+        keyboard = registry.bound[0][3].created_virtual_keyboards[0]
+        runtime._running.set()
+        runtime._owner_thread_id = threading.get_ident()
+        keyboard.calls.clear()
+
+        with patch(
+            "wayland_backend.runtime.time.monotonic_ns",
+            return_value=12_000_000,
+        ):
+            runtime.keyboard_key_down(29)
+            runtime.keyboard_key_down(29)
+            runtime.keyboard_key_down(30)
+            with self.assertRaisesRegex(RuntimeError, "already held"):
+                runtime.keyboard_key_tap(30)
+            runtime.keyboard_key_up(30)
+            runtime.keyboard_key_tap(31)
+            runtime._destroy_virtual_keyboard()
+
+        self.assertEqual(
+            keyboard.calls,
+            [
+                ("key", 12, 29, 1),
+                ("key", 12, 30, 1),
+                ("key", 12, 30, 0),
+                ("key", 12, 31, 1),
+                ("key", 12, 31, 0),
+                ("key", 12, 29, 0),
+                ("destroy",),
+            ],
+        )
+        self.assertEqual(runtime._pressed_keyboard_keys, [])
+        self.assertFalse(runtime.status().virtual_keyboard_ready)
+
+    def test_failed_tap_release_is_retried_during_teardown(self):
+        runtime = WaylandRuntime()
+        runtime._bindings = self._keyboard_bindings()
+        runtime._initialized = True
+        registry = _FakeRegistry()
+        runtime._on_global(
+            registry, 10, "zwp_virtual_keyboard_manager_v1", 1
+        )
+        runtime._on_global(registry, 20, "wl_seat", 11)
+        seat = registry.bound[1][3]
+        seat.dispatcher["capabilities"](seat, 2)
+        self._send_keymap(seat.created_keyboards[0])
+        keyboard = registry.bound[0][3].created_virtual_keyboards[0]
+        runtime._running.set()
+        runtime._owner_thread_id = threading.get_ident()
+        original_key = keyboard.key
+
+        def fail_release(timestamp, keycode, state):
+            original_key(timestamp, keycode, state)
+            if state == 0:
+                raise RuntimeError("release failed")
+
+        with patch(
+            "wayland_backend.runtime.time.monotonic_ns",
+            return_value=15_000_000,
+        ):
+            with patch.object(keyboard, "key", side_effect=fail_release):
+                with self.assertRaisesRegex(RuntimeError, "release failed"):
+                    runtime.keyboard_key_tap(30)
+
+            self.assertEqual(runtime._pressed_keyboard_keys, [30])
+            runtime._destroy_virtual_keyboard()
+
+        self.assertEqual(
+            keyboard.calls[-2:],
+            [("key", 15, 30, 0), ("destroy",)],
+        )
+        self.assertEqual(runtime._pressed_keyboard_keys, [])
 
     def test_pointer_requests_have_expected_protocol_order(self):
         runtime = WaylandRuntime()
@@ -775,6 +1118,38 @@ class WaylandRuntimeTests(unittest.TestCase):
             wake_write.close()
             display_read.close()
             display_write.close()
+
+    def test_disconnect_flush_waits_for_writable_and_retries(self):
+        runtime = WaylandRuntime()
+        display_socket, peer_socket = socket.socketpair()
+        try:
+            display = _FakeDisplay(
+                display_socket.fileno(),
+                flush_results=[-1, 0],
+            )
+            runtime._display = display
+            runtime._bindings = SimpleNamespace(
+                ffi=SimpleNamespace(errno=errno.EAGAIN)
+            )
+
+            runtime._flush_for_disconnect()
+
+            self.assertEqual(display.flush_count, 2)
+        finally:
+            display_socket.close()
+            peer_socket.close()
+
+    def test_disconnect_hard_flush_failure_still_disconnects(self):
+        runtime = WaylandRuntime()
+        display = _FakeDisplay(flush_results=[-1])
+        runtime._display = display
+        runtime._bindings = SimpleNamespace(ffi=SimpleNamespace(errno=5))
+
+        with self.assertRaisesRegex(OSError, "shutdown"):
+            runtime._disconnect()
+
+        self.assertTrue(display.disconnected)
+        self.assertIsNone(runtime._display)
 
     def test_hard_flush_error_cancels_prepared_read(self):
         runtime = WaylandRuntime()
