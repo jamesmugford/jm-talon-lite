@@ -20,6 +20,7 @@ Current features
 * Layout-aware native keyboard input
 * Eye tracking input: Control Mouse (Legacy) fully supported. (Includes custom "Hiss Mouse" mouse mode)
 * Mouse button commands input. (Touch, Righty, Drag, Wheel Up etc) *Beta: Scrolling support* 
+* Active Wayland application and window-title contexts
 * Optional compositor voice-command app layers (currently Hyprland)
 
 Who is this for
@@ -51,6 +52,9 @@ The same runtime also exposes a virtual pointer for mouse, gaze, and hiss input.
 It requires `zwlr_virtual_pointer_manager_v1`, clamps absolute coordinates to
 the normalized desktop, and maps Talon buttons `0`, `1`, and `2` to left,
 right, and middle.
+
+Compositors that expose `zwlr_foreign_toplevel_manager_v1` also populate
+Talon's `app.name` and `win.title` contexts from the active Wayland window.
 
 ## Instuctions
 

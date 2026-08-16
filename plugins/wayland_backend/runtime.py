@@ -175,7 +175,10 @@ def _load_bindings() -> SimpleNamespace:
 class WaylandRuntime:
     """Own a Wayland display and all its proxies on one worker thread."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_active_toplevel: Callable[[ToplevelSnapshot | None], None] | None = None,
+    ) -> None:
         self._lifecycle_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._command_lock = threading.Lock()
@@ -188,6 +191,8 @@ class WaylandRuntime:
         self._error: str | None = None
         self._globals: dict[str, int] = {}
         self._snapshots: dict[int, ToplevelSnapshot] = {}
+        self._active_toplevel: ToplevelSnapshot | None = None
+        self._on_active_toplevel = on_active_toplevel
         self._handles: dict[Any, _PendingToplevel] = {}
         self._proxies: dict[str, tuple[int, Any]] = {}
         self._announced_globals: dict[int, tuple[str, int]] = {}
@@ -223,6 +228,7 @@ class WaylandRuntime:
                     self._error = None
                     self._globals.clear()
                     self._snapshots.clear()
+                    self._active_toplevel = None
                     self._seats.clear()
                     self._selected_seat_global = None
                     self._virtual_pointer = None
@@ -1278,6 +1284,7 @@ class WaylandRuntime:
             self._handles.clear()
             with self._state_lock:
                 self._snapshots.clear()
+            self._publish_active_toplevel()
             proxy._destroy()
         elif not proxy.destroyed:
             proxy.destroy()
@@ -1330,15 +1337,70 @@ class WaylandRuntime:
             pending.states,
         )
         with self._state_lock:
+            previous_snapshot = self._snapshots.get(pending.id)
             self._snapshots[pending.id] = snapshot
+        newly_activated = "activated" in snapshot.states and (
+            previous_snapshot is None
+            or "activated" not in previous_snapshot.states
+        )
+        self._publish_active_toplevel(
+            snapshot,
+            newly_activated=newly_activated,
+        )
 
     def _on_toplevel_closed(self, handle: Any) -> None:
         pending = self._handles.pop(handle, None)
         if pending is not None:
             with self._state_lock:
                 self._snapshots.pop(pending.id, None)
+            self._publish_active_toplevel()
         if not handle.destroyed:
             handle.destroy()
+
+    def _publish_active_toplevel(
+        self,
+        preferred: ToplevelSnapshot | None = None,
+        *,
+        newly_activated: bool = False,
+    ) -> None:
+        with self._state_lock:
+            current = self._active_toplevel
+            current_snapshot = (
+                None if current is None else self._snapshots.get(current.id)
+            )
+            if newly_activated and preferred is not None:
+                active = preferred
+            elif (
+                current_snapshot is not None
+                and "activated" in current_snapshot.states
+            ):
+                active = current_snapshot
+            else:
+                active = next(
+                    (
+                        snapshot
+                        for snapshot in self._snapshots.values()
+                        if "activated" in snapshot.states
+                    ),
+                    None,
+                )
+            previous = self._active_toplevel
+            self._active_toplevel = active
+
+        previous_key = (
+            None
+            if previous is None
+            else (previous.id, previous.app_id, previous.title)
+        )
+        active_key = (
+            None if active is None else (active.id, active.app_id, active.title)
+        )
+        if active_key == previous_key or self._on_active_toplevel is None:
+            return
+        try:
+            self._on_active_toplevel(active)
+        except Exception:
+            traceback.print_exc()
 
     def _on_toplevel_manager_finished(self, manager: Any) -> None:
         interface_name = _TOPLEVEL_MANAGER
@@ -1347,6 +1409,8 @@ class WaylandRuntime:
             self._proxies.pop(interface_name, None)
             with self._state_lock:
                 self._globals.pop(interface_name, None)
+                self._snapshots.clear()
+            self._publish_active_toplevel()
         manager._destroy()
 
     def _event_loop(self) -> None:
@@ -1491,6 +1555,7 @@ class WaylandRuntime:
                     self._xkb_keymap = None
                     self._globals.clear()
                     self._snapshots.clear()
+                self._publish_active_toplevel()
                 self._pressed_keyboard_keys.clear()
 
         if failures:

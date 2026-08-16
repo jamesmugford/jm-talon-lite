@@ -1,4 +1,5 @@
 import errno
+import io
 import math
 import os
 import socket
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,7 +18,11 @@ _added_plugins_path = str(_plugins_dir) not in sys.path
 if _added_plugins_path:
     sys.path.insert(0, str(_plugins_dir))
 try:
-    from wayland_backend.runtime import WaylandRuntime, decode_toplevel_states
+    from wayland_backend.runtime import (
+        ToplevelSnapshot,
+        WaylandRuntime,
+        decode_toplevel_states,
+    )
 finally:
     if _added_plugins_path:
         sys.path.remove(str(_plugins_dir))
@@ -381,6 +387,72 @@ class WaylandRuntimeTests(unittest.TestCase):
         self.assertTrue(handle.destroyed)
         self.assertEqual(runtime._handles, {})
         self.assertEqual(runtime.status().toplevels, ())
+        self.assertIsNone(runtime.status().error)
+
+    def test_active_toplevel_observer_ignores_background_and_duplicate_updates(self):
+        observed = []
+        runtime = WaylandRuntime(observed.append)
+        first = _FakeProxy()
+        second = _FakeProxy()
+        runtime._on_toplevel(None, first)
+        runtime._on_toplevel(None, second)
+
+        first.dispatcher["title"](first, "First")
+        first.dispatcher["app_id"](first, "first.app")
+        first.dispatcher["state"](first, struct.pack("=I", 0))
+        first.dispatcher["done"](first)
+        self.assertEqual(observed, [])
+
+        first.dispatcher["state"](first, struct.pack("=I", 2))
+        first.dispatcher["done"](first)
+        first.dispatcher["done"](first)
+        first.dispatcher["state"](first, struct.pack("=II", 2, 3))
+        first.dispatcher["done"](first)
+        self.assertEqual(
+            observed,
+            [ToplevelSnapshot(1, "First", "first.app", ("activated",))],
+        )
+
+        second.dispatcher["title"](second, "Background")
+        second.dispatcher["app_id"](second, "second.app")
+        second.dispatcher["state"](second, b"")
+        second.dispatcher["done"](second)
+        self.assertEqual(len(observed), 1)
+
+        first.dispatcher["title"](first, "First renamed")
+        first.dispatcher["done"](first)
+        second.dispatcher["state"](second, struct.pack("=I", 2))
+        second.dispatcher["done"](second)
+        first.dispatcher["title"](first, "Stale first title")
+        first.dispatcher["done"](first)
+        first.dispatcher["state"](first, b"")
+        first.dispatcher["done"](first)
+        self.assertEqual(
+            [(item.app_id, item.title) for item in observed],
+            [
+                ("first.app", "First"),
+                ("first.app", "First renamed"),
+                ("second.app", "Background"),
+            ],
+        )
+
+        second.dispatcher["closed"](second)
+        self.assertIsNone(observed[-1])
+
+    def test_active_toplevel_observer_failure_is_not_fatal(self):
+        def fail(_snapshot):
+            raise RuntimeError("observer failed")
+
+        runtime = WaylandRuntime(fail)
+        handle = _FakeProxy()
+        runtime._on_toplevel(None, handle)
+        handle.dispatcher["state"](handle, struct.pack("=I", 2))
+
+        with redirect_stderr(io.StringIO()) as stderr:
+            handle.dispatcher["done"](handle)
+
+        self.assertIn("observer failed", stderr.getvalue())
+        self.assertFalse(runtime._stopping.is_set())
         self.assertIsNone(runtime.status().error)
 
     def test_overlapping_globals_keep_proxy_identity_until_removal(self):
@@ -1692,15 +1764,19 @@ class WaylandRuntimeTests(unittest.TestCase):
         self.assertTrue(runtime._ready.is_set())
 
     def test_disconnect_clears_published_state(self):
-        runtime = WaylandRuntime()
+        observed = []
+        runtime = WaylandRuntime(observed.append)
         runtime._display = _FakeDisplay()
         runtime._globals["test_manager"] = 1
-        runtime._snapshots[1] = SimpleNamespace()
+        active = ToplevelSnapshot(1, "Title", "test.app", ("activated",))
+        runtime._snapshots[1] = active
+        runtime._active_toplevel = active
 
         runtime._disconnect()
 
         self.assertEqual(runtime.status().globals, ())
         self.assertEqual(runtime.status().toplevels, ())
+        self.assertEqual(observed, [None])
 
     def test_autonomous_worker_failure_closes_wakeup_sockets(self):
         runtime = WaylandRuntime()
