@@ -19,7 +19,10 @@ from typing import Any
 
 from .keyboard import (
     KEYMAP_FORMAT_XKB_V1,
+    KeyStroke,
+    XkbKeymap,
     create_keymap_fd,
+    parse_key_spec,
     read_keymap_fd,
     validate_keycode,
 )
@@ -76,6 +79,8 @@ class _Seat:
     capabilities: int = 0
     keyboard: Any = None
     keymap: bytes | None = None
+    locked_modifiers: int = 0
+    group: int = 0
 
 
 @dataclass
@@ -192,6 +197,7 @@ class WaylandRuntime:
         self._pressed_pointer_buttons: set[int] = set()
         self._virtual_keyboard: Any = None
         self._virtual_keyboard_keymap: bytes | None = None
+        self._xkb_keymap: XkbKeymap | None = None
         self._pressed_keyboard_keys: list[int] = []
         self._commands: deque[_Command] = deque()
         self._next_toplevel_id = 1
@@ -222,6 +228,7 @@ class WaylandRuntime:
                     self._virtual_pointer = None
                     self._virtual_keyboard = None
                     self._virtual_keyboard_keymap = None
+                    self._xkb_keymap = None
                 self._handles.clear()
                 self._proxies.clear()
                 self._announced_globals.clear()
@@ -300,6 +307,7 @@ class WaylandRuntime:
                 virtual_keyboard_ready=(
                     self._virtual_keyboard is not None
                     and self._virtual_keyboard_keymap is not None
+                    and self._xkb_keymap is not None
                 ),
                 error=self._error,
             )
@@ -368,20 +376,31 @@ class WaylandRuntime:
             timeout,
         )
 
-    def keyboard_key_down(self, keycode: int, timeout: float = 1.0) -> None:
-        """Press a Linux evdev keycode with the staged virtual keyboard."""
-        keycode = validate_keycode(keycode)
-        self._submit(lambda: self._emit_keyboard_key(keycode, pressed=True), timeout)
+    def pointer_modified_click(
+        self, modifiers: str, button: int = 0, timeout: float = 1.0
+    ) -> None:
+        """Click while holding one Talon modifier chord."""
+        strokes = parse_key_spec(modifiers)
+        if (
+            len(strokes) != 1
+            or strokes[0].key is not None
+            or strokes[0].action != "tap"
+        ):
+            raise ValueError("Modified click requires one modifier-only chord")
+        names = strokes[0].modifiers
+        down = (KeyStroke(names, None, "down", 1),)
+        up = (KeyStroke(names, None, "up", 1),)
+        button_code = linux_button_code(button)
+        self._submit(
+            lambda: self._emit_pointer_modified_click(down, up, button_code),
+            timeout,
+        )
 
-    def keyboard_key_up(self, keycode: int, timeout: float = 1.0) -> None:
-        """Release a Linux evdev keycode with the staged virtual keyboard."""
-        keycode = validate_keycode(keycode)
-        self._submit(lambda: self._emit_keyboard_key(keycode, pressed=False), timeout)
-
-    def keyboard_key_tap(self, keycode: int, timeout: float = 1.0) -> None:
-        """Press and release a Linux evdev keycode."""
-        keycode = validate_keycode(keycode)
-        self._submit(lambda: self._emit_keyboard_tap(keycode), timeout)
+    def key(self, key_spec: str, timeout: float = 1.0) -> None:
+        """Send a Talon key spec through the virtual keyboard."""
+        strokes = parse_key_spec(key_spec)
+        if strokes:
+            self._submit(lambda: self._emit_key_spec(strokes), timeout)
 
     def _submit(self, callback: Callable[[], Any], timeout: float) -> Any:
         timeout = _validate_timeout(timeout)
@@ -701,6 +720,8 @@ class WaylandRuntime:
         with self._state_lock:
             seat.keyboard = keyboard
             seat.keymap = None
+            seat.locked_modifiers = 0
+            seat.group = 0
         keyboard.dispatcher["keymap"] = self._guard_callback(
             lambda source, format, fd, size: self._on_seat_keymap(
                 seat.global_name,
@@ -710,6 +731,17 @@ class WaylandRuntime:
                 size,
             )
         )
+        def on_modifiers(source, _serial, _depressed, _latched, locked, group):
+            # Depressed masks include our own virtual device and would feed back.
+            self._on_seat_modifiers(
+                seat.global_name,
+                source,
+                locked,
+                group,
+            )
+
+        keyboard.dispatcher["modifiers"] = self._guard_callback(on_modifiers)
+
     def _release_seat_keyboard(self, seat: _Seat) -> None:
         with self._state_lock:
             keyboard = seat.keyboard
@@ -767,6 +799,31 @@ class WaylandRuntime:
             return
         self._apply_virtual_keyboard_keymap(seat, virtual_keyboard)
 
+    def _on_seat_modifiers(
+        self,
+        global_name: int,
+        source: Any,
+        locked_modifiers: int,
+        group: int,
+    ) -> None:
+        with self._state_lock:
+            seat = self._seats.get(global_name)
+            if seat is None or seat.keyboard is not source:
+                return
+            seat.locked_modifiers = locked_modifiers
+            seat.group = group
+            selected = global_name == self._selected_seat_global
+            keyboard = self._virtual_keyboard
+            xkb_keymap = self._xkb_keymap
+        if not selected:
+            return
+        if keyboard is None or xkb_keymap is None:
+            self._maybe_create_virtual_keyboard()
+            return
+        modifiers = xkb_keymap.set_external_state(locked_modifiers, group)
+        if modifiers is not None:
+            keyboard.modifiers(*modifiers)
+
     def _maybe_create_virtual_keyboard(self) -> None:
         if not self._initialized or self._stopping.is_set():
             return
@@ -810,29 +867,47 @@ class WaylandRuntime:
             ):
                 return
             self._virtual_keyboard_keymap = None
-        self._release_pressed_keyboard_keys(keyboard)
-        fd = create_keymap_fd(keymap)
+        xkb_keymap = XkbKeymap(
+            keymap,
+            locked_modifiers=seat.locked_modifiers,
+            group=seat.group,
+        )
         try:
-            keyboard.keymap(KEYMAP_FORMAT_XKB_V1, fd, len(keymap))
-        finally:
-            os.close(fd)
+            self._release_pressed_keyboard_keys(keyboard)
+            fd = create_keymap_fd(keymap)
+            try:
+                keyboard.keymap(KEYMAP_FORMAT_XKB_V1, fd, len(keymap))
+            finally:
+                os.close(fd)
+            modifiers = xkb_keymap.modifiers()
+            if any(modifiers):
+                keyboard.modifiers(*modifiers)
+        except Exception:
+            xkb_keymap.close()
+            raise
+        old_xkb_keymap = self._xkb_keymap
+        self._xkb_keymap = xkb_keymap
+        if old_xkb_keymap is not None:
+            old_xkb_keymap.close()
         with self._state_lock:
             if self._virtual_keyboard is keyboard:
                 self._virtual_keyboard_keymap = keymap
 
     def _release_pressed_keyboard_keys(self, keyboard: Any) -> None:
-        timestamp = self._timestamp_ms()
         for keycode in reversed(tuple(self._pressed_keyboard_keys)):
-            keyboard.key(timestamp, keycode, _KEY_RELEASED)
-            self._pressed_keyboard_keys.remove(keycode)
+            self._send_keyboard_key(keyboard, keycode, pressed=False)
 
     def _destroy_virtual_keyboard(self) -> None:
         with self._state_lock:
             keyboard = self._virtual_keyboard
             self._virtual_keyboard = None
             self._virtual_keyboard_keymap = None
+        xkb_keymap = self._xkb_keymap
         if keyboard is None:
             self._pressed_keyboard_keys.clear()
+            if xkb_keymap is not None:
+                xkb_keymap.close()
+                self._xkb_keymap = None
             return
         try:
             try:
@@ -852,6 +927,10 @@ class WaylandRuntime:
                 keyboard.destroy()
         finally:
             self._pressed_keyboard_keys.clear()
+            if xkb_keymap is not None:
+                xkb_keymap.close()
+            if self._xkb_keymap is xkb_keymap:
+                self._xkb_keymap = None
 
     def _maybe_create_virtual_pointer(self) -> None:
         if not self._initialized or self._stopping.is_set():
@@ -900,14 +979,16 @@ class WaylandRuntime:
     def _timestamp_ms() -> int:
         return (time.monotonic_ns() // 1_000_000) & 0xFFFFFFFF
 
-    def _require_virtual_keyboard(self) -> Any:
+    def _require_virtual_keyboard(self) -> tuple[Any, XkbKeymap]:
         with self._state_lock:
             keyboard = self._virtual_keyboard
             keymap = self._virtual_keyboard_keymap
+            xkb_keymap = self._xkb_keymap
             seat = self._seats.get(self._selected_seat_global)
             ready = (
                 keyboard is not None
                 and keymap is not None
+                and xkb_keymap is not None
                 and seat is not None
                 and seat.keyboard is not None
                 and not seat.keyboard.destroyed
@@ -915,35 +996,116 @@ class WaylandRuntime:
             )
         if not ready or keyboard.destroyed:
             raise RuntimeError("Wayland virtual keyboard is not ready")
-        return keyboard
+        return keyboard, xkb_keymap
 
-    def _emit_keyboard_key(self, keycode: int, *, pressed: bool) -> None:
+    def _send_keyboard_key(
+        self, keyboard: Any, keycode: int, *, pressed: bool
+    ) -> None:
         keycode = validate_keycode(keycode)
-        keyboard = self._require_virtual_keyboard()
         if pressed and keycode in self._pressed_keyboard_keys:
             return
         if not pressed and keycode not in self._pressed_keyboard_keys:
             return
-        keyboard.key(
-            self._timestamp_ms(),
-            keycode,
-            _KEY_PRESSED if pressed else _KEY_RELEASED,
-        )
-        if pressed:
-            self._pressed_keyboard_keys.append(keycode)
-        else:
-            self._pressed_keyboard_keys.remove(keycode)
+        try:
+            keyboard.key(
+                self._timestamp_ms(),
+                keycode,
+                _KEY_PRESSED if pressed else _KEY_RELEASED,
+            )
+            if pressed:
+                self._pressed_keyboard_keys.append(keycode)
+            else:
+                self._pressed_keyboard_keys.remove(keycode)
+            if self._xkb_keymap is not None:
+                modifiers = self._xkb_keymap.update_key(keycode, pressed)
+                if modifiers is not None:
+                    keyboard.modifiers(*modifiers)
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
-    def _emit_keyboard_tap(self, keycode: int) -> None:
-        keycode = validate_keycode(keycode)
-        if keycode in self._pressed_keyboard_keys:
-            raise RuntimeError("Cannot tap a keyboard key that is already held")
-        keyboard = self._require_virtual_keyboard()
-        timestamp = self._timestamp_ms()
-        keyboard.key(timestamp, keycode, _KEY_PRESSED)
-        self._pressed_keyboard_keys.append(keycode)
-        keyboard.key(timestamp, keycode, _KEY_RELEASED)
-        self._pressed_keyboard_keys.remove(keycode)
+    def _emit_pointer_modified_click(
+        self,
+        down: tuple[KeyStroke, ...],
+        up: tuple[KeyStroke, ...],
+        button_code: int,
+    ) -> None:
+        self._require_virtual_keyboard()
+        self._require_virtual_pointer()
+        if button_code in self._pressed_pointer_buttons:
+            raise RuntimeError("Cannot click a pointer button that is already held")
+        self._emit_key_spec(down)
+        try:
+            try:
+                self._emit_pointer_click(button_code)
+            except Exception as exc:
+                self._record_failure(exc)
+                raise
+        finally:
+            self._emit_key_spec(up)
+
+    def _emit_key_spec(self, strokes: tuple[KeyStroke, ...]) -> None:
+        keyboard, xkb_keymap = self._require_virtual_keyboard()
+        resolved_strokes = []
+        for stroke in strokes:
+            modifiers = [
+                xkb_keymap.resolve_modifier(name) for name in stroke.modifiers
+            ]
+            keycode = None
+            if stroke.key is not None:
+                keycode, implicit_modifiers = xkb_keymap.resolve_key(stroke.key)
+                modifiers.extend(implicit_modifiers)
+            modifiers = list(dict.fromkeys(modifiers))
+            resolved_strokes.append((stroke, keycode, modifiers))
+
+        for stroke, keycode, modifiers in resolved_strokes:
+            if stroke.action == "down":
+                for modifier in modifiers:
+                    self._send_keyboard_key(keyboard, modifier, pressed=True)
+                if keycode is not None:
+                    self._send_keyboard_key(keyboard, keycode, pressed=True)
+                continue
+
+            if stroke.action == "up":
+                if keycode is not None:
+                    self._send_keyboard_key(keyboard, keycode, pressed=False)
+                for modifier in reversed(modifiers):
+                    self._send_keyboard_key(keyboard, modifier, pressed=False)
+                continue
+
+            if keycode is None:
+                for _ in range(stroke.repeat):
+                    pressed_here = [
+                        modifier
+                        for modifier in modifiers
+                        if modifier not in self._pressed_keyboard_keys
+                    ]
+                    try:
+                        for modifier in pressed_here:
+                            self._send_keyboard_key(keyboard, modifier, pressed=True)
+                    finally:
+                        for modifier in reversed(pressed_here):
+                            self._send_keyboard_key(keyboard, modifier, pressed=False)
+                continue
+
+            pressed_here = [
+                modifier
+                for modifier in modifiers
+                if modifier not in self._pressed_keyboard_keys
+            ]
+            try:
+                for modifier in pressed_here:
+                    self._send_keyboard_key(keyboard, modifier, pressed=True)
+                if keycode in self._pressed_keyboard_keys:
+                    raise RuntimeError(
+                        f"Cannot tap keyboard keycode {keycode} while it is held"
+                    )
+                for _ in range(stroke.repeat):
+                    self._send_keyboard_key(keyboard, keycode, pressed=True)
+                    self._send_keyboard_key(keyboard, keycode, pressed=False)
+            finally:
+                for modifier in reversed(pressed_here):
+                    self._send_keyboard_key(keyboard, modifier, pressed=False)
 
     def _require_virtual_pointer(self) -> Any:
         with self._state_lock:
@@ -1084,16 +1246,24 @@ class WaylandRuntime:
         handle.dispatcher["closed"] = self._guard_callback(self._on_toplevel_closed)
 
     def _on_toplevel_title(self, handle: Any, title: str) -> None:
-        self._handles[handle].title = title
+        pending = self._handles.get(handle)
+        if pending is not None:
+            pending.title = title
 
     def _on_toplevel_app_id(self, handle: Any, app_id: str) -> None:
-        self._handles[handle].app_id = app_id
+        pending = self._handles.get(handle)
+        if pending is not None:
+            pending.app_id = app_id
 
     def _on_toplevel_state(self, handle: Any, payload: bytes) -> None:
-        self._handles[handle].states = decode_toplevel_states(payload)
+        pending = self._handles.get(handle)
+        if pending is not None:
+            pending.states = decode_toplevel_states(payload)
 
     def _on_toplevel_done(self, handle: Any) -> None:
-        pending = self._handles[handle]
+        pending = self._handles.get(handle)
+        if pending is None:
+            return
         snapshot = ToplevelSnapshot(
             pending.id,
             pending.title,
@@ -1259,6 +1429,7 @@ class WaylandRuntime:
                     self._virtual_pointer = None
                     self._virtual_keyboard = None
                     self._virtual_keyboard_keymap = None
+                    self._xkb_keymap = None
                     self._globals.clear()
                     self._snapshots.clear()
                 self._pressed_keyboard_keys.clear()

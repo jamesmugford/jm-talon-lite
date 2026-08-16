@@ -1,14 +1,17 @@
-"""Talon actions for the staged in-process Wayland runtime."""
+"""Talon integration for the in-process Wayland input runtime."""
 
+import os
 import sys
 
-from talon import Module
+from talon import Context, Module, actions, app
 
 from .wayland_backend.runtime import WaylandRuntime
 
 mod = Module()
+ctx = Context()
+ctx.matches = "os: linux"
 _RUNTIME_KEY = "_jm_talon_lite_wayland_runtime"
-# Talon reloads modules in-process, so stop the previous owner thread first.
+# The sys slot survives Talon reloads, so stop its previous owner thread first.
 _previous_runtime = getattr(sys, _RUNTIME_KEY, None)
 if _previous_runtime is not None:
     _previous_runtime.stop()
@@ -19,17 +22,17 @@ setattr(sys, _RUNTIME_KEY, _runtime)
 @mod.action_class
 class Actions:
     def wayland_runtime_start() -> None:
-        """Start staged Wayland discovery and virtual-input diagnostics."""
+        """Start Wayland discovery and virtual input."""
         _runtime.start()
         print(f"Wayland runtime started: {_runtime.status()}")
 
     def wayland_runtime_stop() -> None:
-        """Stop the staged Wayland runtime."""
+        """Stop the Wayland runtime."""
         _runtime.stop()
         print("Wayland runtime stopped")
 
     def wayland_runtime_status() -> str:
-        """Return the staged Wayland runtime status."""
+        """Return the Wayland runtime status."""
         return str(_runtime.status())
 
     def wayland_pointer_move_absolute(x: float, y: float) -> None:
@@ -58,14 +61,38 @@ class Actions:
         """Scroll discrete steps with the staged virtual pointer."""
         _runtime.pointer_scroll(vertical_steps, horizontal_steps)
 
-    def wayland_keyboard_key_down(keycode: int) -> None:
-        """Press a raw Linux evdev keycode with the staged keyboard."""
-        _runtime.keyboard_key_down(keycode)
+    def wayland_pointer_modified_click(
+        modifiers: str, button: int = 0
+    ) -> None:
+        """Click the native pointer while holding Talon modifiers."""
+        _runtime.pointer_modified_click(modifiers, button)
 
-    def wayland_keyboard_key_up(keycode: int) -> None:
-        """Release a raw Linux evdev keycode with the staged keyboard."""
-        _runtime.keyboard_key_up(keycode)
 
-    def wayland_keyboard_key_tap(keycode: int) -> None:
-        """Tap a raw Linux evdev keycode with the staged keyboard."""
-        _runtime.keyboard_key_tap(keycode)
+@ctx.action_class("main")
+class MainActions:
+    def key(key: str):
+        """Send Talon key syntax through the native Wayland keyboard."""
+        if not _is_wayland():
+            actions.next(key)
+            return
+        _runtime.key(key)
+
+
+def _is_wayland() -> bool:
+    return bool(
+        os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("SWAYSOCK")
+        or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    )
+
+
+def _on_ready() -> None:
+    if not _is_wayland():
+        return
+    try:
+        _runtime.start()
+    except Exception as exc:
+        print(f"Wayland runtime startup failed: {exc}", file=sys.stderr, flush=True)
+
+
+app.register("ready", _on_ready)

@@ -11,13 +11,122 @@ if _added_plugins_path:
 try:
     from wayland_backend.keyboard import (
         KEY_MAX,
+        KeyStroke,
+        XkbKeymap,
         create_keymap_fd,
+        parse_key_spec,
         read_keymap_fd,
         validate_keycode,
     )
 finally:
     if _added_plugins_path:
         sys.path.remove(str(_plugins_dir))
+
+
+_US_KEYMAP = b"""xkb_keymap {
+    xkb_keycodes { include "evdev+aliases(qwerty)" };
+    xkb_types { include "complete" };
+    xkb_compatibility { include "complete" };
+    xkb_symbols { include "pc+us" };
+};
+\0"""
+
+_US_GB_KEYMAP = b"""xkb_keymap {
+    xkb_keycodes { include "evdev+aliases(qwerty)" };
+    xkb_types { include "complete" };
+    xkb_compatibility { include "complete" };
+    xkb_symbols { include "pc+us+gb:2+inet(evdev)" };
+};
+\0"""
+
+
+class TalonKeySpecTests(unittest.TestCase):
+    def test_parses_sequences_chords_and_repeats(self):
+        self.assertEqual(
+            parse_key_spec("ctrl-, ctrl-f esc:2 shift:down shift:up"),
+            (
+                KeyStroke(("ctrl",), ",", "tap", 1),
+                KeyStroke(("ctrl",), "f", "tap", 1),
+                KeyStroke((), "esc", "tap", 2),
+                KeyStroke(("shift",), None, "down", 1),
+                KeyStroke(("shift",), None, "up", 1),
+            ),
+        )
+
+    def test_literal_hyphen_and_colon_remain_keys(self):
+        self.assertEqual(
+            parse_key_spec("- ctrl-- :"),
+            (
+                KeyStroke((), "-", "tap", 1),
+                KeyStroke(("ctrl",), "-", "tap", 1),
+                KeyStroke((), ":", "tap", 1),
+            ),
+        )
+
+    def test_empty_spec_is_a_noop(self):
+        self.assertEqual(parse_key_spec("  "), ())
+
+    def test_invalid_spec_is_rejected(self):
+        for value in (":down", "a:0"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_key_spec(value)
+        with self.assertRaises(TypeError):
+            parse_key_spec(1)
+
+
+class XkbKeymapTests(unittest.TestCase):
+    def setUp(self):
+        self.keymap = XkbKeymap(_US_KEYMAP)
+
+    def tearDown(self):
+        self.keymap.close()
+
+    def test_resolves_characters_with_keymap_modifiers(self):
+        self.assertEqual(self.keymap.resolve_key("a"), (30, ()))
+        self.assertEqual(self.keymap.resolve_key("A"), (30, (42,)))
+        self.assertEqual(self.keymap.resolve_key("!"), (2, (42,)))
+
+    def test_resolves_talon_named_keys(self):
+        self.assertEqual(self.keymap.resolve_key("esc"), (1, ()))
+        self.assertEqual(self.keymap.resolve_key("pageup"), (104, ()))
+        self.assertEqual(self.keymap.resolve_key("keypad_1"), (79, ()))
+        self.assertEqual(self.keymap.resolve_modifier("ctrl"), 29)
+
+    def test_tracks_modifier_protocol_state(self):
+        depressed = self.keymap.update_key(42, True)
+        released = self.keymap.update_key(42, False)
+
+        self.assertIsNotNone(depressed)
+        self.assertNotEqual(depressed[0], 0)
+        self.assertEqual(depressed[1:], (0, 0, 0))
+        self.assertEqual(released, (0, 0, 0, 0))
+
+    def test_locked_modifiers_change_character_resolution(self):
+        self.assertEqual(self.keymap.resolve_key("a"), (30, ()))
+
+        self.assertEqual(self.keymap.set_external_state(2, 0), (0, 0, 2, 0))
+
+        self.assertEqual(self.keymap.resolve_key("a"), (30, (42,)))
+        self.assertEqual(self.keymap.resolve_key("A"), (30, ()))
+
+    def test_active_layout_changes_character_resolution(self):
+        keymap = XkbKeymap(_US_GB_KEYMAP)
+        try:
+            with self.assertRaisesRegex(ValueError, "not available"):
+                keymap.resolve_key("£")
+
+            self.assertEqual(keymap.set_external_state(0, 1), (0, 0, 0, 1))
+
+            self.assertEqual(keymap.resolve_key("£"), (4, (42,)))
+        finally:
+            keymap.close()
+
+    def test_rejects_unknown_or_unavailable_keys(self):
+        with self.assertRaisesRegex(ValueError, "Unknown Talon key"):
+            self.keymap.resolve_key("definitely_not_a_key")
+        with self.assertRaisesRegex(ValueError, "not available"):
+            self.keymap.resolve_key("£")
 
 
 class WaylandKeyboardValueTests(unittest.TestCase):

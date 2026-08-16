@@ -1,7 +1,10 @@
-"""Virtual-keyboard keycode and keymap file-descriptor helpers."""
+"""Talon key specs and compositor-provided XKB keymaps."""
 
 from __future__ import annotations
 
+import ctypes
+from dataclasses import dataclass
+from itertools import combinations
 import mmap
 import os
 import tempfile
@@ -10,6 +13,421 @@ import tempfile
 KEY_MAX = 0x2FF
 KEYMAP_FORMAT_XKB_V1 = 1
 MAX_KEYMAP_SIZE = 16 * 1024 * 1024
+
+_XKB_KEY_UP = 0
+_XKB_KEY_DOWN = 1
+_XKB_KEYSYM_CASE_INSENSITIVE = 1
+_XKB_STATE_MODS_DEPRESSED = 1 << 0
+_XKB_STATE_MODS_LATCHED = 1 << 1
+_XKB_STATE_MODS_LOCKED = 1 << 2
+_XKB_STATE_LAYOUT_EFFECTIVE = 1 << 7
+_XKB_STATE_MODIFIERS = (
+    _XKB_STATE_MODS_DEPRESSED
+    | _XKB_STATE_MODS_LATCHED
+    | _XKB_STATE_MODS_LOCKED
+)
+
+_MODIFIER_KEYSYMS = {
+    "ctrl": "Control_L",
+    "alt": "Alt_L",
+    "shift": "Shift_L",
+    "super": "Super_L",
+}
+_LEVEL_MODIFIER_KEYSYMS = (
+    "Shift_L",
+    "ISO_Level3_Shift",
+    "ISO_Level5_Shift",
+    "Mode_switch",
+)
+_KEYSYM_ALIASES = {
+    "esc": "Escape",
+    "enter": "Return",
+    "space": "space",
+    "backspace": "BackSpace",
+    "delete": "Delete",
+    "insert": "Insert",
+    "home": "Home",
+    "end": "End",
+    "pageup": "Page_Up",
+    "pagedown": "Page_Down",
+    "left": "Left",
+    "right": "Right",
+    "up": "Up",
+    "down": "Down",
+    "menu": "Menu",
+    "printscr": "Print",
+    "minus": "-",
+    "volup": "XF86AudioRaiseVolume",
+    "voldown": "XF86AudioLowerVolume",
+    "mute": "XF86AudioMute",
+    "play": "XF86AudioPlay",
+    "play_pause": "XF86AudioPlay",
+    "next": "XF86AudioNext",
+    "prev": "XF86AudioPrev",
+}
+_KEYPAD_KEY_NAMES = {
+    **{str(number): f"KP{number}" for number in range(10)},
+    "decimal": "KPDL",
+    "plus": "KPAD",
+    "minus": "KPSU",
+    "multiply": "KPMU",
+    "divide": "KPDV",
+    "equals": "KPEQ",
+    "clear": "KP5",
+    "enter": "KPEN",
+}
+_xkb_library = None
+
+
+@dataclass(frozen=True)
+class KeyStroke:
+    modifiers: tuple[str, ...]
+    key: str | None
+    action: str
+    repeat: int
+
+
+def parse_key_spec(key_spec: str) -> tuple[KeyStroke, ...]:
+    """Parse Talon's space-separated key syntax."""
+    if not isinstance(key_spec, str):
+        raise TypeError("Talon key spec must be a string")
+
+    strokes = []
+    for token in key_spec.split():
+        base, action, repeat = _parse_suffix(token)
+        parts = base.split("-")
+        modifiers = []
+        while parts and parts[0] in _MODIFIER_KEYSYMS:
+            modifier = parts.pop(0)
+            if modifier not in modifiers:
+                modifiers.append(modifier)
+        key = "-".join(parts) or None
+        if key is None and not modifiers:
+            raise ValueError(f"Invalid Talon key: {token!r}")
+        strokes.append(KeyStroke(tuple(modifiers), key, action, repeat))
+    return tuple(strokes)
+
+
+def _parse_suffix(token: str) -> tuple[str, str, int]:
+    if ":" not in token:
+        return token, "tap", 1
+    base, suffix = token.rsplit(":", 1)
+    if suffix in ("down", "up"):
+        if not base:
+            raise ValueError(f"Invalid Talon key: {token!r}")
+        return base, suffix, 1
+    if suffix.isdigit():
+        repeat = int(suffix)
+        if not base or repeat < 1:
+            raise ValueError(f"Invalid Talon key repeat: {token!r}")
+        return base, "tap", repeat
+    return token, "tap", 1
+
+
+class XkbKeymap:
+    """Resolve keysyms and track modifiers for one XKB-v1 keymap."""
+
+    def __init__(
+        self, data: bytes, locked_modifiers: int = 0, group: int = 0
+    ):
+        if not isinstance(data, bytes) or not data.endswith(b"\0"):
+            raise ValueError("XKB-v1 keymap must be null-terminated bytes")
+
+        self._lib = _load_xkbcommon()
+        self._context = self._lib.xkb_context_new(0)
+        self._keymap = None
+        self._state = None
+        self._pressed_keys = []
+        self._locked_modifiers = _validate_uint32(
+            locked_modifiers, "XKB locked modifiers"
+        )
+        self._group = _validate_uint32(group, "XKB layout group")
+        if not self._context:
+            raise RuntimeError("Could not create an XKB context")
+        try:
+            self._keymap = self._lib.xkb_keymap_new_from_string(
+                self._context,
+                data,
+                KEYMAP_FORMAT_XKB_V1,
+                0,
+            )
+            if not self._keymap:
+                raise ValueError("Could not parse the compositor XKB keymap")
+            self._state = self._new_state()
+            self._keys, self._modifiers = self._build_key_index()
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._state:
+            self._lib.xkb_state_unref(self._state)
+            self._state = None
+        if self._keymap:
+            self._lib.xkb_keymap_unref(self._keymap)
+            self._keymap = None
+        if self._context:
+            self._lib.xkb_context_unref(self._context)
+            self._context = None
+
+    def resolve_key(self, name: str) -> tuple[int, tuple[int, ...]]:
+        normalized = name.lower()
+        if normalized.startswith("keypad_"):
+            key_name = _KEYPAD_KEY_NAMES.get(normalized.removeprefix("keypad_"))
+            if key_name is None:
+                raise ValueError(f"Unknown Talon key: {name!r}")
+            xkb_keycode = self._lib.xkb_keymap_key_by_name(
+                self._keymap, key_name.encode("ascii")
+            )
+            if xkb_keycode != 0xFFFFFFFF:
+                return validate_keycode(xkb_keycode - 8), ()
+            raise ValueError(f"Key {name!r} is not available in the active keymap")
+
+        keysym = self._keysym(name)
+        resolved = self._keys.get(keysym)
+        if resolved is None:
+            raise ValueError(f"Key {name!r} is not available in the active keymap")
+        return resolved
+
+    def resolve_modifier(self, name: str) -> int:
+        try:
+            return self._modifiers[name]
+        except KeyError as exc:
+            raise ValueError(
+                f"Modifier {name!r} is not available in the active keymap"
+            ) from exc
+
+    def modifiers(self) -> tuple[int, int, int, int]:
+        return self._serialize_modifiers()
+
+    def set_external_state(
+        self, locked_modifiers: int, group: int
+    ) -> tuple[int, int, int, int] | None:
+        """Apply source-keyboard lock and layout state without physical holds."""
+        locked_modifiers = _validate_uint32(
+            locked_modifiers, "XKB locked modifiers"
+        )
+        group = _validate_uint32(group, "XKB layout group")
+        if (
+            locked_modifiers == self._locked_modifiers
+            and group == self._group
+        ):
+            return None
+
+        self._locked_modifiers = locked_modifiers
+        self._group = group
+        state = self._new_state()
+        try:
+            for keycode in self._pressed_keys:
+                self._lib.xkb_state_update_key(
+                    state, keycode + 8, _XKB_KEY_DOWN
+                )
+        except Exception:
+            self._lib.xkb_state_unref(state)
+            raise
+        old_state = self._state
+        self._state = state
+        self._lib.xkb_state_unref(old_state)
+        self._keys, self._modifiers = self._build_key_index()
+        return self._serialize_modifiers()
+
+    def update_key(
+        self, keycode: int, pressed: bool
+    ) -> tuple[int, int, int, int] | None:
+        changed = self._lib.xkb_state_update_key(
+            self._state,
+            validate_keycode(keycode) + 8,
+            _XKB_KEY_DOWN if pressed else _XKB_KEY_UP,
+        )
+        if pressed:
+            if keycode not in self._pressed_keys:
+                self._pressed_keys.append(keycode)
+        else:
+            if keycode in self._pressed_keys:
+                self._pressed_keys.remove(keycode)
+        if not changed & (_XKB_STATE_MODIFIERS | _XKB_STATE_LAYOUT_EFFECTIVE):
+            return None
+        modifiers = self._serialize_modifiers()
+        if (
+            modifiers[2] != self._locked_modifiers
+            or modifiers[3] != self._group
+        ):
+            self._locked_modifiers = modifiers[2]
+            self._group = modifiers[3]
+            self._keys, self._modifiers = self._build_key_index()
+        return modifiers
+
+    def _serialize_modifiers(self) -> tuple[int, int, int, int]:
+        return (
+            self._lib.xkb_state_serialize_mods(
+                self._state, _XKB_STATE_MODS_DEPRESSED
+            ),
+            self._lib.xkb_state_serialize_mods(
+                self._state, _XKB_STATE_MODS_LATCHED
+            ),
+            self._lib.xkb_state_serialize_mods(
+                self._state, _XKB_STATE_MODS_LOCKED
+            ),
+            self._lib.xkb_state_serialize_layout(
+                self._state, _XKB_STATE_LAYOUT_EFFECTIVE
+            ),
+        )
+
+    def _new_state(self):
+        state = self._lib.xkb_state_new(self._keymap)
+        if not state:
+            raise RuntimeError("Could not create XKB keyboard state")
+        self._lib.xkb_state_update_mask(
+            state,
+            0,
+            0,
+            self._locked_modifiers,
+            0,
+            0,
+            self._group,
+        )
+        return state
+
+    def _build_key_index(
+        self,
+    ) -> tuple[dict[int, tuple[int, tuple[int, ...]]], dict[str, int]]:
+        minimum = self._lib.xkb_keymap_min_keycode(self._keymap)
+        maximum = self._lib.xkb_keymap_max_keycode(self._keymap)
+        base_state = self._new_state()
+        try:
+            base_keys = {
+                self._lib.xkb_state_key_get_one_sym(base_state, keycode): keycode - 8
+                for keycode in range(minimum, maximum + 1)
+                if keycode >= 9
+            }
+        finally:
+            self._lib.xkb_state_unref(base_state)
+
+        modifiers = {}
+        for name, keysym_name in _MODIFIER_KEYSYMS.items():
+            keycode = base_keys.get(self._named_keysym(keysym_name))
+            if keycode is not None:
+                modifiers[name] = keycode
+
+        level_modifiers = []
+        for keysym_name in _LEVEL_MODIFIER_KEYSYMS:
+            keycode = base_keys.get(self._named_keysym(keysym_name))
+            if keycode is not None and keycode not in level_modifiers:
+                level_modifiers.append(keycode)
+
+        keys = {}
+        for count in range(len(level_modifiers) + 1):
+            for active_modifiers in combinations(level_modifiers, count):
+                state = self._new_state()
+                try:
+                    for keycode in active_modifiers:
+                        self._lib.xkb_state_update_key(
+                            state, keycode + 8, _XKB_KEY_DOWN
+                        )
+                    for xkb_keycode in range(minimum, maximum + 1):
+                        if xkb_keycode < 9:
+                            continue
+                        keysym = self._lib.xkb_state_key_get_one_sym(
+                            state, xkb_keycode
+                        )
+                        if keysym:
+                            keys.setdefault(
+                                keysym,
+                                (xkb_keycode - 8, active_modifiers),
+                            )
+                finally:
+                    self._lib.xkb_state_unref(state)
+        return keys, modifiers
+
+    def _keysym(self, name: str) -> int:
+        if len(name) == 1:
+            keysym = self._lib.xkb_utf32_to_keysym(ord(name))
+        else:
+            normalized = name.lower()
+            keysym_name = _KEYSYM_ALIASES.get(normalized, name)
+            if len(keysym_name) == 1:
+                keysym = self._lib.xkb_utf32_to_keysym(ord(keysym_name))
+            else:
+                keysym = self._named_keysym(keysym_name)
+        if not keysym:
+            raise ValueError(f"Unknown Talon key: {name!r}")
+        return keysym
+
+    def _named_keysym(self, name: str) -> int:
+        return self._lib.xkb_keysym_from_name(
+            name.encode("ascii"), _XKB_KEYSYM_CASE_INSENSITIVE
+        )
+
+
+def _load_xkbcommon():
+    global _xkb_library
+    if _xkb_library is not None:
+        return _xkb_library
+
+    lib = ctypes.CDLL("libxkbcommon.so.0")
+    void_pointer = ctypes.c_void_p
+    uint32_pointer = ctypes.c_uint32
+
+    lib.xkb_context_new.argtypes = [ctypes.c_int]
+    lib.xkb_context_new.restype = void_pointer
+    lib.xkb_context_unref.argtypes = [void_pointer]
+    lib.xkb_context_unref.restype = None
+    lib.xkb_keymap_new_from_string.argtypes = [
+        void_pointer,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.xkb_keymap_new_from_string.restype = void_pointer
+    lib.xkb_keymap_unref.argtypes = [void_pointer]
+    lib.xkb_keymap_unref.restype = None
+    lib.xkb_keymap_min_keycode.argtypes = [void_pointer]
+    lib.xkb_keymap_min_keycode.restype = uint32_pointer
+    lib.xkb_keymap_max_keycode.argtypes = [void_pointer]
+    lib.xkb_keymap_max_keycode.restype = uint32_pointer
+    lib.xkb_keymap_key_by_name.argtypes = [void_pointer, ctypes.c_char_p]
+    lib.xkb_keymap_key_by_name.restype = uint32_pointer
+    lib.xkb_state_new.argtypes = [void_pointer]
+    lib.xkb_state_new.restype = void_pointer
+    lib.xkb_state_unref.argtypes = [void_pointer]
+    lib.xkb_state_unref.restype = None
+    lib.xkb_state_key_get_one_sym.argtypes = [void_pointer, uint32_pointer]
+    lib.xkb_state_key_get_one_sym.restype = uint32_pointer
+    lib.xkb_state_update_key.argtypes = [
+        void_pointer,
+        uint32_pointer,
+        ctypes.c_int,
+    ]
+    lib.xkb_state_update_key.restype = ctypes.c_int
+    lib.xkb_state_update_mask.argtypes = [
+        void_pointer,
+        uint32_pointer,
+        uint32_pointer,
+        uint32_pointer,
+        uint32_pointer,
+        uint32_pointer,
+        uint32_pointer,
+    ]
+    lib.xkb_state_update_mask.restype = ctypes.c_int
+    lib.xkb_state_serialize_mods.argtypes = [void_pointer, ctypes.c_int]
+    lib.xkb_state_serialize_mods.restype = uint32_pointer
+    lib.xkb_state_serialize_layout.argtypes = [void_pointer, ctypes.c_int]
+    lib.xkb_state_serialize_layout.restype = uint32_pointer
+    lib.xkb_keysym_from_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    lib.xkb_keysym_from_name.restype = uint32_pointer
+    lib.xkb_utf32_to_keysym.argtypes = [uint32_pointer]
+    lib.xkb_utf32_to_keysym.restype = uint32_pointer
+
+    _xkb_library = lib
+    return lib
+
+
+def _validate_uint32(value: int, label: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{label} must be an integer")
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError(f"{label} must fit an unsigned 32-bit integer")
+    return value
 
 
 def validate_keycode(keycode: int) -> int:

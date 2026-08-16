@@ -4,7 +4,6 @@ import sys
 
 from talon import Context, Module, actions, app, settings, ui
 
-from .key_forwarder.dotool_translate import talon_key_to_dotool_actions
 from .shared.pure_utils import (
     accumulate_scroll_steps,
     desktop_bounds_from_rects,
@@ -154,14 +153,6 @@ def _send_dotool_lines(lines: list[str]) -> None:
 
 def _send_dotool_line(line: str) -> None:
     _send_dotool_lines([line])
-
-
-def _modified_click_lines(modifiers: str, button_name: str) -> list[str]:
-    return [
-        *talon_key_to_dotool_actions(f"{modifiers}:down"),
-        f"click {button_name}",
-        *talon_key_to_dotool_actions(f"{modifiers}:up"),
-    ]
 
 
 def _release_all_buttons() -> bool:
@@ -315,17 +306,14 @@ class UserActions:
 
     @staticmethod
     def mouse_forwarder_modified_click(modifiers: str, button: int = 0):
-        if not _is_wayland():
-            actions.key(f"{modifiers}:down")
+        if _is_wayland():
+            actions.user.wayland_pointer_modified_click(modifiers, button)
+            return
+        actions.key(f"{modifiers}:down")
+        try:
             actions.mouse_click(button)
+        finally:
             actions.key(f"{modifiers}:up")
-            return
-
-        button_name = _button_name(button)
-        if button_name is None:
-            actions.mouse_click(button)
-            return
-        _send_dotool_lines(_modified_click_lines(modifiers, button_name))
 
     @staticmethod
     def mouse_scroll_up(amount: float = 1):

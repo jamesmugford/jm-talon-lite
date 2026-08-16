@@ -17,7 +17,7 @@ It is entirely event driven, so it will introduce virtually no latency.
 
 Current features
 ===
-* Raw keyboard input
+* Layout-aware native keyboard input
 * Eye tracking input: Control Mouse (Legacy) fully supported. (Includes custom "Hiss Mouse" mouse mode)
 * Mouse button commands input. (Touch, Righty, Drag, Wheel Up etc) *Beta: Scrolling support* 
 * Optional compositor voice-command app layers (currently Hyprland)
@@ -35,21 +35,24 @@ environment - this will be break a significant number of the features you are us
 
 Current supported back ends
 ===
-* Dotool
-* _More can be added (Ideas and pull requests are welcome)_
+* In-process Wayland virtual keyboard
+* Dotool for pointer forwarding while the native pointer migration is completed
 
-An experimental in-process Wayland runtime is included for Talon's CPython
-3.13 x86-64 build on Linux with glibc 2.34 or newer. It currently supports
-registry discovery, foreign-toplevel tracking, seat selection, and manual
-virtual-pointer and raw virtual-keyboard diagnostics; it does not replace
-Dotool yet. Use the Talon
-actions `user.wayland_runtime_start()`, `user.wayland_runtime_status()`, and
-`user.wayland_runtime_stop()` to exercise it. Pointer diagnostics require the
-compositor to advertise `zwlr_virtual_pointer_manager_v1`; after starting,
-wait for the status to show `virtual_pointer_ready=True` before using them.
-Keyboard diagnostics similarly require `zwp_virtual_keyboard_manager_v1` and
-`virtual_keyboard_ready=True`. The runtime mirrors the selected seat's
-compositor-provided XKB keymap rather than generating a separate layout.
+The in-process runtime supports Talon's CPython 3.13 x86-64 build on Linux with
+glibc 2.34 or newer and `libxkbcommon.so.0`. It starts automatically in Wayland
+sessions and routes `actions.key()` through `zwp_virtual_keyboard_manager_v1`.
+The runtime mirrors the selected seat's compositor-provided XKB keymap, so
+letters and symbols follow that layout without a separate remapping table.
+Talon key sequences, chords, `:down`, `:up`, and repeat suffixes are supported.
+Use `user.wayland_runtime_status()` to confirm `virtual_keyboard_ready=True`.
+The virtual keyboard starts in keymap group 0 and follows later lock or layout
+events when the compositor supplies them to the headless Talon connection.
+
+The same runtime also exposes a staged virtual pointer. Pointer diagnostics
+require `zwlr_virtual_pointer_manager_v1`; wait for
+`virtual_pointer_ready=True` before using them. The explicit
+`user.wayland_runtime_start()` and `user.wayland_runtime_stop()` actions remain
+available for diagnostics.
 
 Pointer diagnostics clamp absolute coordinates to `0..1`, accept relative
 compositor-space deltas, and map Talon buttons `0`, `1`, and `2` to left,
@@ -62,23 +65,14 @@ actions.user.wayland_pointer_click(0)
 actions.user.wayland_pointer_scroll(vertical_steps=1)
 ```
 
-Keyboard diagnostics currently accept raw Linux evdev keycodes only. They do
-not yet translate Talon key names or synthesize keymap-specific modifier masks:
-
-```python
-actions.user.wayland_keyboard_key_down(30)  # KEY_A
-actions.user.wayland_keyboard_key_up(30)
-actions.user.wayland_keyboard_key_tap(194)  # KEY_F24
-```
-
-
 ## Instuctions
 
 ```sh
 git clone https://github.com/jamesmugford/jm-talon-lite $HOME/.talon/user/jm-talon-lite
 ```
 
-Install Wayland compatible input backend:
+Pointer forwarding still requires Dotool until the native pointer migration is
+complete:
 
 * Currently supported: **Dotool:** https://git.sr.ht/~geb/dotool
 
