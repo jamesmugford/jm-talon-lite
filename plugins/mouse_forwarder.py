@@ -24,6 +24,9 @@ os: linux
 
 @mod.action_class
 class Actions:
+    def mouse_forwarder_touch():
+        """Click normally, or release an active drag."""
+
     def mouse_forwarder_scroll_up(amount: float = 1):
         """Scroll up via the native Wayland pointer."""
 
@@ -136,6 +139,11 @@ class MainActions:
 
 @ctx.action_class("user")
 class UserActions:
+    def mouse_forwarder_touch():
+        if actions.user.mouse_drag_end():
+            return
+        actions.mouse_click(0)
+
     def mouse_forwarder_scroll_up(amount: float = 1):
         if not _is_wayland():
             actions.user.mouse_scroll_up(amount)

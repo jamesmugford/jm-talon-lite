@@ -1,6 +1,6 @@
 tag: user.wayland_mouse_forwarder
 -
-touch: mouse_click(0)
+touch: user.mouse_forwarder_touch()
 
 righty: mouse_click(1)
 
