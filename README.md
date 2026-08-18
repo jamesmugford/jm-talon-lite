@@ -4,6 +4,11 @@ A lightweight shim to forward Talon input to Wayland backends.
 
 This is a drop in config, that you can drop in alongside the community or any other custom config. 
 
+> **Native Wayland transition:** Talon Lite recently moved from Dotool to native
+> Wayland protocols. The previous implementation remains available on the
+> [`legacy/dotool`](https://github.com/jamesmugford/jmtalonlite/tree/legacy/dotool)
+> branch, but native Wayland is the supported path going forward.
+
 This takes a progressive enhancement approach to adding features, keeping the core features compositor-agnostic
 while allowing optional compositor-specific app layers.
 
