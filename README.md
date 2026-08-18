@@ -56,7 +56,7 @@ Linux X11, macOS, or Windows are unavailable under Wayland.
 ## Wayland protocols
 
 - `zwp_virtual_keyboard_manager_v1` - keyboard input
-- `zwlr_virtual_pointer_manager_v1` - pointer, clicks, scrolling, gaze, bundled hiss and pop mouse
+- `zwlr_virtual_pointer_manager_v1` - pointer, clicks, scrolling, gaze, hiss, and pop input
 - `zwlr_foreign_toplevel_manager_v1` - application and window-title contexts
 
 ## Installation
@@ -65,7 +65,8 @@ Linux X11, macOS, or Windows are unavailable under Wayland.
 git clone https://github.com/jamesmugford/jmtalonlite $HOME/.talon/user/jmtalonlite
 ```
 
-Talon Lite is clone-and-run. Runtime dependencies and
+Talon Lite is clone-and-run and only requires `libxkbcommon.so.0`, which is
+normally already installed on Wayland desktops. Other runtime dependencies and
 protocol bindings are bundled, so no additional packages, input daemons, or
 uinput setup are required. Restart Talon after cloning.
 
