@@ -70,7 +70,7 @@ Talon's `app.name` and `win.title` contexts from the active Wayland window.
 ## Instuctions
 
 ```sh
-git clone https://github.com/jamesmugford/jm-talon-lite $HOME/.talon/user/jm-talon-lite
+git clone https://github.com/jamesmugford/jmtalonlite $HOME/.talon/user/jmtalonlite
 ```
 
 Pointer forwarding uses the in-process Wayland runtime and does not require a
