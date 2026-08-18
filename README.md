@@ -39,6 +39,17 @@ Current supported back ends
 * In-process Wayland virtual keyboard
 * In-process Wayland virtual pointer
 
+Supported compositors
+===
+* Hyprland
+* labwc
+* Mir
+* niri
+* phoc
+* river
+* Sway
+* Wayfire
+
 The in-process runtime supports Talon's CPython 3.13 x86-64 build on Linux with
 glibc 2.34 or newer and `libxkbcommon.so.0`. It starts automatically in Wayland
 sessions and routes `actions.key()` through `zwp_virtual_keyboard_manager_v1`.

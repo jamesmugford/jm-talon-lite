@@ -14,6 +14,11 @@ ctx.matches = "os: linux"
 _RUNTIME_KEY = "_jm_talon_lite_wayland_runtime"
 _CONTEXT_JOB_KEY = "_jm_talon_lite_wayland_context_job"
 _SCOPE_ORIGINALS_KEY = "_jm_talon_lite_wayland_scope_originals"
+_PROTOCOL_FEATURES = {
+    "zwp_virtual_keyboard_manager_v1": "keyboard forwarding",
+    "zwlr_virtual_pointer_manager_v1": "pointer, gaze, and hiss forwarding",
+    "zwlr_foreign_toplevel_manager_v1": "application and window contexts",
+}
 
 
 def _is_wayland() -> bool:
@@ -94,6 +99,21 @@ def _has_toplevel_manager() -> bool:
         name == "zwlr_foreign_toplevel_manager_v1"
         for name, _version in _runtime.status().globals
     )
+
+
+def _warn_for_missing_protocols() -> None:
+    available = {name for name, _version in _runtime.status().globals}
+    missing = [
+        f"{protocol} ({feature})"
+        for protocol, feature in _PROTOCOL_FEATURES.items()
+        if protocol not in available
+    ]
+    if missing:
+        print(
+            "Wayland compositor compatibility warning: missing " + "; ".join(missing),
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _install_scope_providers() -> None:
@@ -271,6 +291,7 @@ def _on_ready() -> None:
     try:
         _initialize_scope_declarations()
         _runtime.start()
+        _warn_for_missing_protocols()
         if _has_toplevel_manager():
             _install_scope_providers()
         registry.register("update_decls", _on_declarations_updated)
