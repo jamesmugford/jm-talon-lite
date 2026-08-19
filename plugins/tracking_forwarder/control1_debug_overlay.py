@@ -1,29 +1,106 @@
-from talon import Context, Module, actions, app, tracking_system, ui
-from talon.canvas import Canvas
-from talon.plugins import eye_mouse
+"""Per-screen debug overlays for the current Control Mouse gaze point."""
 
-from ..shared.pure_utils import rect_local_point
+import sys
+
+from talon import Context, Module, actions, app, tracking_system, ui
+
+_RELOAD_STATE_KEY = "_jm_talon_lite_control1_overlay_state"
+_legacy_enabled = bool(globals().get("_overlay_enabled", False))
+_legacy_callback = (
+    globals().get("_on_gaze") if globals().get("_gaze_registered", False) else None
+)
+_legacy_entries = tuple(globals().get("_canvas_entries", ()))
+_previous_enabled = _legacy_enabled
+_previous_callbacks = {_legacy_callback} - {None}
+_previous_entries = list(_legacy_entries)
+_previous_state = getattr(sys, _RELOAD_STATE_KEY, None)
+if _previous_state is not None:
+    if len(_previous_state) == 3:
+        _state_enabled, _state_callbacks, _state_entries = _previous_state
+        _previous_enabled = bool(_state_enabled)
+        _previous_callbacks.update(_state_callbacks)
+    else:
+        _state_callback, _state_entries = _previous_state
+        _previous_enabled = _previous_enabled or bool(_state_entries)
+        if _state_callback is not None:
+            _previous_callbacks.add(_state_callback)
+    _known_entries = {(id(canvas), id(draw)) for canvas, draw in _previous_entries}
+    for _state_entry in _state_entries:
+        _state_identity = (id(_state_entry[0]), id(_state_entry[1]))
+        if _state_identity not in _known_entries:
+            _previous_entries.append(_state_entry)
+            _known_entries.add(_state_identity)
+
+if _previous_callbacks or _previous_entries:
+    _previous_failures = []
+    _previous_failed_callbacks = []
+    _previous_remaining = []
+    for _previous_callback in _previous_callbacks:
+        _previous_callback_failed = False
+        for _ in range(16):
+            try:
+                tracking_system.unregister("gaze", _previous_callback)
+            except Exception as exc:
+                _previous_callback_failed = True
+                _previous_failures.append(("gaze callback", exc))
+        if _previous_callback_failed:
+            _previous_failed_callbacks.append(_previous_callback)
+    for _previous_canvas, _previous_draw in _previous_entries:
+        try:
+            _previous_canvas.unregister("draw", _previous_draw)
+        except Exception as exc:
+            _previous_failures.append(("canvas callback", exc))
+        try:
+            _previous_canvas.close()
+        except Exception as exc:
+            _previous_remaining.append((_previous_canvas, _previous_draw))
+            _previous_failures.append(("canvas", exc))
+    if _previous_failures:
+        setattr(
+            sys,
+            _RELOAD_STATE_KEY,
+            (
+                _previous_enabled,
+                tuple(_previous_failed_callbacks),
+                tuple(_previous_remaining),
+            ),
+        )
+        _label, _previous_error = _previous_failures[0]
+        for _label, _secondary in _previous_failures[1:]:
+            _previous_error.add_note(
+                f"{_label} also failed: {type(_secondary).__name__}: {_secondary}"
+            )
+        raise _previous_error.with_traceback(_previous_error.__traceback__)
+setattr(sys, _RELOAD_STATE_KEY, (_previous_enabled, (), ()))
+
+from talon.canvas import Canvas  # noqa: E402
+from talon.plugins import eye_mouse  # noqa: E402
+
+from ..wayland_backend.geometry import local_point  # noqa: E402
 
 ctx = Context()
 mod = Module()
 
-_overlay_enabled = False
+_overlay_enabled = _previous_enabled
 _gaze_registered = False
 _dot_pos = None
 _canvas_entries = []
 
 
 def _make_draw(rect):
+    """Return a canvas callback that draws the current gaze point."""
+
     def _draw(c):
+        """Draw the gaze marker when it falls inside this screen."""
         if _dot_pos is None:
             return
 
         x, y = _dot_pos
-        local_point = rect_local_point(rect, x, y)
-        if local_point is None:
+        point = local_point(rect, x, y)
+        if point is None:
             return
 
-        lx, ly = local_point
+        lx, ly = point
 
         c.paint.style = c.paint.Style.STROKE
         c.paint.color = "00ff00cc"
@@ -37,38 +114,88 @@ def _make_draw(rect):
     return _draw
 
 
+def _publish_reload_state() -> None:
+    """Retain exact callback and canvas identities across Talon reloads."""
+    callbacks = (_on_gaze,) if _gaze_registered else ()
+    setattr(
+        sys,
+        _RELOAD_STATE_KEY,
+        (_overlay_enabled, callbacks, tuple(_canvas_entries)),
+    )
+
+
 def _close_canvases() -> None:
+    """Close every overlay canvas while preserving the first failure."""
     global _canvas_entries
-    for canvas, draw_cb in _canvas_entries:
-        canvas.unregister("draw", draw_cb)
-        canvas.close()
-    _canvas_entries = []
+    entries = _canvas_entries
+    remaining = []
+    first_error = None
+    for canvas, draw_cb in entries:
+        try:
+            canvas.unregister("draw", draw_cb)
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            else:
+                first_error.add_note(
+                    f"Canvas unregister also failed: {type(exc).__name__}: {exc}"
+                )
+        try:
+            canvas.close()
+        except Exception as exc:
+            remaining.append((canvas, draw_cb))
+            if first_error is None:
+                first_error = exc
+            else:
+                first_error.add_note(
+                    f"Canvas close also failed: {type(exc).__name__}: {exc}"
+                )
+    _canvas_entries = remaining
+    _publish_reload_state()
+    if first_error is not None:
+        raise first_error.with_traceback(first_error.__traceback__)
 
 
 def _create_canvases() -> None:
+    """Recreate one gaze overlay canvas for every Talon screen."""
     global _canvas_entries
     _close_canvases()
 
     entries = []
-    for screen in ui.screens():
-        rect = screen.rect
-        draw_cb = _make_draw((rect.x, rect.y, rect.width, rect.height))
-        canvas = Canvas.from_screen(screen)
-        canvas.register("draw", draw_cb)
-        entries.append((canvas, draw_cb))
+    try:
+        for screen in ui.screens():
+            rect = screen.rect
+            draw_cb = _make_draw((rect.x, rect.y, rect.width, rect.height))
+            canvas = Canvas.from_screen(screen)
+            entries.append((canvas, draw_cb))
+            canvas.register("draw", draw_cb)
+    except Exception as exc:
+        _canvas_entries = entries
+        try:
+            _close_canvases()
+        except Exception as cleanup_error:
+            exc.add_note(
+                "Partial canvas cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
 
     _canvas_entries = entries
+    _publish_reload_state()
 
 
 def _register_gaze() -> None:
+    """Register this generation's gaze callback exactly once."""
     global _gaze_registered
     if _gaze_registered:
         return
     tracking_system.register("gaze", _on_gaze)
     _gaze_registered = True
+    _publish_reload_state()
 
 
 def _clear_overlay() -> None:
+    """Clear the marker from every open overlay canvas."""
     global _dot_pos
     _dot_pos = None
     for canvas, _draw_cb in _canvas_entries:
@@ -76,14 +203,37 @@ def _clear_overlay() -> None:
 
 
 def _unregister_gaze() -> None:
+    """Unregister this generation's gaze callback idempotently."""
     global _gaze_registered
     if not _gaze_registered:
         return
     tracking_system.unregister("gaze", _on_gaze)
     _gaze_registered = False
+    _publish_reload_state()
+
+
+def _teardown_overlay() -> None:
+    """Release gaze and canvas resources while preserving all failures."""
+    first_error = None
+    try:
+        _unregister_gaze()
+    except Exception as exc:
+        first_error = exc
+    try:
+        _close_canvases()
+    except Exception as exc:
+        if first_error is None:
+            first_error = exc
+        else:
+            first_error.add_note(
+                f"Canvas teardown also failed: {type(exc).__name__}: {exc}"
+            )
+    if first_error is not None:
+        raise first_error.with_traceback(first_error.__traceback__)
 
 
 def _sync_overlay() -> None:
+    """Match gaze subscription state to overlay and Control Mouse state."""
     if not _overlay_enabled:
         _unregister_gaze()
         _clear_overlay()
@@ -98,6 +248,7 @@ def _sync_overlay() -> None:
 
 
 def _on_gaze(*_args) -> None:
+    """Update every canvas from the latest enabled Control Mouse sample."""
     global _dot_pos
     if not _overlay_enabled:
         return
@@ -117,20 +268,35 @@ def _on_gaze(*_args) -> None:
 
 
 def _on_screen_change(_screens) -> None:
+    """Rebuild enabled overlays after Talon's screen layout changes."""
+    global _overlay_enabled
     if not _overlay_enabled:
         return
-    _create_canvases()
+    try:
+        _create_canvases()
+    except Exception as exc:
+        _overlay_enabled = False
+        try:
+            _teardown_overlay()
+        except Exception as cleanup_error:
+            exc.add_note(
+                "Overlay rebuild rollback also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
 
 
 @ctx.action_class("user")
 class UserActions:
     @staticmethod
     def control1_started() -> None:
+        """Synchronize the overlay after Control Mouse starts."""
         actions.next()
         _sync_overlay()
 
     @staticmethod
     def control1_stopped() -> None:
+        """Synchronize the overlay after Control Mouse stops."""
         actions.next()
         _sync_overlay()
 
@@ -145,20 +311,27 @@ class Actions:
             print("control1_debug_overlay already running")
             return
         _overlay_enabled = True
-        _create_canvases()
-        _sync_overlay()
+        try:
+            _create_canvases()
+            _sync_overlay()
+        except Exception as exc:
+            _overlay_enabled = False
+            try:
+                _teardown_overlay()
+            except Exception as cleanup_error:
+                exc.add_note(
+                    "Overlay rollback also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
         print("control1_debug_overlay started")
 
     @staticmethod
     def control1_debug_overlay_stop() -> None:
         """Stop control1 debug overlay."""
         global _overlay_enabled
-        if not _overlay_enabled:
-            print("control1_debug_overlay stopped")
-            return
         _overlay_enabled = False
-        _unregister_gaze()
-        _close_canvases()
+        _teardown_overlay()
         print("control1_debug_overlay stopped")
 
     @staticmethod
@@ -177,7 +350,34 @@ class Actions:
 
 
 def _on_ready() -> None:
+    """Subscribe to Talon screen-layout changes."""
     ui.register("screen_change", _on_screen_change)
 
 
+def _on_quit() -> None:
+    """Release every tracking callback and canvas before Talon exits."""
+    global _overlay_enabled
+    _overlay_enabled = False
+    _teardown_overlay()
+    if not _gaze_registered and not _canvas_entries and hasattr(sys, _RELOAD_STATE_KEY):
+        delattr(sys, _RELOAD_STATE_KEY)
+
+
+if _overlay_enabled:
+    try:
+        _create_canvases()
+        _sync_overlay()
+    except Exception as exc:
+        _overlay_enabled = False
+        try:
+            _teardown_overlay()
+        except Exception as cleanup_error:
+            exc.add_note(
+                "Overlay reload rollback also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
+else:
+    _publish_reload_state()
 app.register("ready", _on_ready)
+app.register("quit", _on_quit)

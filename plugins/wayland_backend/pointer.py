@@ -1,8 +1,15 @@
-"""Pure virtual-pointer value conversions."""
+"""Virtual-pointer values, lifecycle, and protocol operations."""
 
 from __future__ import annotations
 
 import math
+import threading
+from collections.abc import Callable
+from typing import Any
+
+from .connection import WaylandConnection, monotonic_timestamp_ms, run_cleanup_steps
+from .errors import CapabilityUnavailable
+from .seats import SeatRegistry
 
 POINTER_EXTENT = 65535
 WAYLAND_FIXED_MIN = -(1 << 23)
@@ -14,6 +21,12 @@ BUTTON_CODES = {
     1: 0x111,  # BTN_RIGHT
     2: 0x112,  # BTN_MIDDLE
 }
+_AXIS_VERTICAL = 0
+_AXIS_HORIZONTAL = 1
+_AXIS_SOURCE_WHEEL = 0
+_BUTTON_RELEASED = 0
+_BUTTON_PRESSED = 1
+_SCROLL_DISTANCE_PER_STEP = 15.0
 
 
 def validate_wayland_fixed(value: float, field: str) -> float:
@@ -51,9 +64,8 @@ def normalized_to_extent(
         or not isinstance(y, (int, float))
     ):
         raise TypeError("Pointer coordinates must be numbers")
-    if (
-        (isinstance(x, float) and not math.isfinite(x))
-        or (isinstance(y, float) and not math.isfinite(y))
+    if (isinstance(x, float) and not math.isfinite(x)) or (
+        isinstance(y, float) and not math.isfinite(y)
     ):
         raise ValueError("Pointer coordinates must be finite")
     x = min(1.0, max(0.0, x))
@@ -69,3 +81,355 @@ def linux_button_code(button: int) -> int:
         return BUTTON_CODES[button]
     except KeyError as exc:
         raise ValueError(f"Unsupported mouse button: {button}") from exc
+
+
+class VirtualPointer:
+    """Own zwlr_virtual_pointer_manager_v1 and its selected-seat pointer."""
+
+    interface_name = "zwlr_virtual_pointer_manager_v1"
+    multiple = False
+
+    def __init__(
+        self,
+        connection: WaylandConnection,
+        seats: SeatRegistry,
+        timestamp_ms: Callable[[], int] = monotonic_timestamp_ms,
+    ) -> None:
+        """Create an unavailable pointer without performing protocol I/O."""
+        self._connection = connection
+        self._seats = seats
+        self._timestamp_ms = timestamp_ms
+        self._lock = threading.Lock()
+        self._manager_name: int | None = None
+        self._manager: Any = None
+        self._pointer: Any = None
+        self._seat_id: int | None = None
+        self._held_buttons: set[int] = set()
+        self._unsubscribe_seats = seats.subscribe(self._on_seat_changed)
+
+    def bind(self, registry: Any, name: int, version: int, interface: type) -> int:
+        """Bind the pointer manager and create a pointer when a seat exists."""
+        negotiated = min(version, interface.version)
+        manager = registry.bind(name, interface, negotiated)
+        with self._lock:
+            self._manager_name = name
+            self._manager = manager
+        self._maybe_create()
+        return negotiated
+
+    def remove(self, name: int) -> None:
+        """Destroy the pointer before releasing its removed manager."""
+        with self._lock:
+            if name != self._manager_name:
+                return
+            manager = self._manager
+            self._manager_name = None
+            self._manager = None
+        run_cleanup_steps(
+            (
+                ("virtual pointer", self._destroy_pointer),
+                ("virtual pointer manager", lambda: self._destroy_manager(manager)),
+            )
+        )
+
+    def ready(self) -> None:
+        """Create the virtual pointer after initial registry synchronization."""
+        self._maybe_create()
+
+    def close(self) -> None:
+        """Release held buttons, the virtual pointer, and its manager."""
+        with self._lock:
+            manager = self._manager
+            self._manager_name = None
+            self._manager = None
+        run_cleanup_steps(
+            (
+                ("virtual pointer", self._destroy_pointer),
+                ("virtual pointer manager", lambda: self._destroy_manager(manager)),
+            )
+        )
+
+    def available(self) -> bool:
+        """Return whether a usable virtual pointer currently exists."""
+        with self._lock:
+            return self._pointer is not None and not self._pointer.destroyed
+
+    def move_absolute(
+        self,
+        x: float,
+        y: float,
+        *,
+        refresh_hover: bool = False,
+        timeout: float = 1.0,
+    ) -> None:
+        """Move to normalized desktop coordinates through the owner thread."""
+        if type(refresh_hover) is not bool:
+            raise TypeError("Pointer hover refresh must be a boolean")
+        x_value, y_value = normalized_to_extent(x, y)
+        self._connection.execute(
+            lambda: self._emit_absolute(x_value, y_value, refresh_hover),
+            timeout,
+        )
+
+    def move_relative(self, dx: float, dy: float, *, timeout: float = 1.0) -> None:
+        """Move by a relative compositor-space delta."""
+        x_value = validate_wayland_fixed(dx, "Pointer x delta")
+        y_value = validate_wayland_fixed(dy, "Pointer y delta")
+        self._connection.execute(lambda: self._emit_relative(x_value, y_value), timeout)
+
+    def set_button(self, button: int, pressed: bool, *, timeout: float = 1.0) -> None:
+        """Establish one Talon button's requested pressed state idempotently."""
+        if type(pressed) is not bool:
+            raise TypeError("Pointer button state must be a boolean")
+        code = linux_button_code(button)
+        self._connection.execute(lambda: self._emit_button(code, pressed), timeout)
+
+    def toggle_button(self, button: int, *, timeout: float = 1.0) -> bool:
+        """Toggle one Talon button and return its new pressed state."""
+        code = linux_button_code(button)
+        return self._connection.execute(lambda: self._toggle_code(code), timeout)
+
+    def click(self, button: int = 0, *, timeout: float = 1.0) -> None:
+        """Press and release one Talon button as an intentional repeated effect."""
+        code = linux_button_code(button)
+        self._connection.execute(lambda: self._click_code(code), timeout)
+
+    def release_all(self, *, timeout: float = 1.0) -> bool:
+        """Release all held buttons and report whether state changed."""
+        return self._connection.execute(self._release_all_codes, timeout)
+
+    def scroll(
+        self,
+        vertical: int = 0,
+        horizontal: int = 0,
+        *,
+        timeout: float = 1.0,
+    ) -> None:
+        """Emit discrete wheel steps, with positive vertical values moving down."""
+        vertical = validate_int32(vertical, "Vertical scroll steps")
+        horizontal = validate_int32(horizontal, "Horizontal scroll steps")
+        validate_wayland_fixed(
+            vertical * _SCROLL_DISTANCE_PER_STEP,
+            "Vertical scroll distance",
+        )
+        validate_wayland_fixed(
+            horizontal * _SCROLL_DISTANCE_PER_STEP,
+            "Horizontal scroll distance",
+        )
+        self._connection.execute(
+            lambda: self._emit_scroll(vertical, horizontal), timeout
+        )
+
+    def _on_seat_changed(self) -> None:
+        """Recreate the pointer when selected-seat identity changes."""
+        seat = self._seats.selected()
+        seat_id = None if seat is None else seat.id
+        with self._lock:
+            old_seat_id = self._seat_id
+        if old_seat_id != seat_id:
+            self._destroy_pointer()
+        self._maybe_create()
+
+    def _maybe_create(self) -> None:
+        """Create a virtual pointer when manager, seat, and startup are ready."""
+        if not self._connection.initialized or self._connection.stopping:
+            return
+        seat = self._seats.selected()
+        with self._lock:
+            manager = self._manager
+            pointer = self._pointer
+        if manager is None or seat is None or pointer is not None:
+            return
+        pointer = manager.create_virtual_pointer(seat.proxy)
+        with self._lock:
+            self._pointer = pointer
+            self._seat_id = seat.id
+
+    def _destroy_pointer(self) -> None:
+        """Release held buttons and destroy the current pointer idempotently."""
+        with self._lock:
+            pointer = self._pointer
+            self._pointer = None
+            self._seat_id = None
+        if pointer is None:
+            self._held_buttons.clear()
+            return
+        try:
+            try:
+                if not pointer.destroyed and self._held_buttons:
+                    timestamp = self._timestamp_ms()
+                    run_cleanup_steps(
+                        (
+                            *(
+                                (
+                                    f"button {code}",
+                                    lambda code=code: pointer.button(
+                                        timestamp,
+                                        code,
+                                        _BUTTON_RELEASED,
+                                    ),
+                                )
+                                for code in sorted(self._held_buttons)
+                            ),
+                            ("button release frame", pointer.frame),
+                        )
+                    )
+            except Exception as release_error:
+                try:
+                    if not pointer.destroyed:
+                        pointer.destroy()
+                except Exception as destroy_error:
+                    release_error.add_note(
+                        "Virtual pointer destroy also failed: "
+                        f"{type(destroy_error).__name__}: {destroy_error}"
+                    )
+                raise
+            if not pointer.destroyed:
+                pointer.destroy()
+        finally:
+            self._held_buttons.clear()
+
+    @staticmethod
+    def _destroy_manager(manager: Any) -> None:
+        """Destroy one virtual-pointer manager when it remains live."""
+        if manager is not None and not manager.destroyed:
+            manager.destroy()
+
+    def _require_pointer(self) -> Any:
+        """Return the active pointer or raise a capability error."""
+        with self._lock:
+            pointer = self._pointer
+        if pointer is None or pointer.destroyed:
+            raise CapabilityUnavailable("Wayland virtual pointer is not available")
+        return pointer
+
+    def _emit_absolute(self, x: int, y: int, refresh_hover: bool) -> None:
+        """Emit one absolute motion transaction on the owner thread."""
+        pointer = self._require_pointer()
+        try:
+            pointer.motion_absolute(
+                self._timestamp_ms(),
+                x,
+                y,
+                POINTER_EXTENT,
+                POINTER_EXTENT,
+            )
+            pointer.frame()
+            if refresh_hover:
+                nudge = -1.0 if x == POINTER_EXTENT else 1.0
+                pointer.motion(self._timestamp_ms(), nudge, 0.0)
+                pointer.frame()
+                pointer.motion(self._timestamp_ms(), -nudge, 0.0)
+                pointer.frame()
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise
+
+    def _emit_relative(self, dx: float, dy: float) -> None:
+        """Emit one relative motion transaction on the owner thread."""
+        pointer = self._require_pointer()
+        try:
+            pointer.motion(self._timestamp_ms(), dx, dy)
+            pointer.frame()
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise
+
+    def _emit_button(self, code: int, pressed: bool) -> None:
+        """Emit a button transition only when its state changes."""
+        if (code in self._held_buttons) == pressed:
+            self._require_pointer()
+            return
+        pointer = self._require_pointer()
+        try:
+            pointer.button(
+                self._timestamp_ms(),
+                code,
+                _BUTTON_PRESSED if pressed else _BUTTON_RELEASED,
+            )
+            if pressed:
+                self._held_buttons.add(code)
+            pointer.frame()
+            if not pressed:
+                self._held_buttons.remove(code)
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise
+
+    def _click_code(self, code: int) -> None:
+        """Emit one ordered press-and-release transaction for a Linux button."""
+        pointer = self._require_clickable(code)
+        try:
+            timestamp = self._timestamp_ms()
+            pointer.button(timestamp, code, _BUTTON_PRESSED)
+            self._held_buttons.add(code)
+            pointer.frame()
+            pointer.button(timestamp, code, _BUTTON_RELEASED)
+            pointer.frame()
+            self._held_buttons.remove(code)
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise
+
+    def _require_clickable(self, code: int) -> Any:
+        """Return the pointer after confirming a button can be clicked."""
+        pointer = self._require_pointer()
+        if code in self._held_buttons:
+            raise RuntimeError("Cannot click a pointer button that is already held")
+        return pointer
+
+    def _toggle_code(self, code: int) -> bool:
+        """Toggle one Linux button code on the owner thread."""
+        pressed = code not in self._held_buttons
+        self._emit_button(code, pressed)
+        return pressed
+
+    def _release_all_codes(self) -> bool:
+        """Release every held Linux button code on the owner thread."""
+        self._require_pointer()
+        held = tuple(sorted(self._held_buttons))
+        run_cleanup_steps(
+            (
+                (
+                    f"button {code}",
+                    lambda code=code: self._emit_button(code, False),
+                )
+                for code in held
+            )
+        )
+        return bool(held)
+
+    def _emit_scroll(self, vertical: int, horizontal: int) -> None:
+        """Emit one wheel transaction containing both requested axes."""
+        pointer = self._require_pointer()
+        if vertical == 0 and horizontal == 0:
+            return
+        vertical_value = validate_wayland_fixed(
+            vertical * _SCROLL_DISTANCE_PER_STEP,
+            "Vertical scroll distance",
+        )
+        horizontal_value = validate_wayland_fixed(
+            horizontal * _SCROLL_DISTANCE_PER_STEP,
+            "Horizontal scroll distance",
+        )
+        try:
+            timestamp = self._timestamp_ms()
+            pointer.axis_source(_AXIS_SOURCE_WHEEL)
+            if vertical:
+                pointer.axis_discrete(
+                    timestamp,
+                    _AXIS_VERTICAL,
+                    vertical_value,
+                    vertical,
+                )
+            if horizontal:
+                pointer.axis_discrete(
+                    timestamp,
+                    _AXIS_HORIZONTAL,
+                    horizontal_value,
+                    horizontal,
+                )
+            pointer.frame()
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise

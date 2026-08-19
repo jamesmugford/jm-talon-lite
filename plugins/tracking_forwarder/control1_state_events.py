@@ -1,13 +1,14 @@
+"""Event-driven hooks for Control Mouse enabled-state transitions."""
+
 from talon import Context, Module, actions, app
 from talon.plugins import eye_mouse_2
-
-from ..shared.pure_utils import should_emit_state_change
 
 ctx = Context()
 mod = Module()
 
 
 def _emit_control1_state(enabled: bool) -> None:
+    """Publish one changed Control Mouse state through user hooks."""
     print(f"control1 enabled={enabled}")
     actions.user.control1_state_changed(enabled)
     if enabled:
@@ -17,6 +18,7 @@ def _emit_control1_state(enabled: bool) -> None:
 
 
 def _install_menu_hook() -> bool:
+    """Wrap Talon's Control Mouse menu callback exactly once."""
     item = getattr(eye_mouse_2, "control1_item", None)
     if item is None:
         return False
@@ -25,24 +27,30 @@ def _install_menu_hook() -> bool:
     if attrs is None:
         return False
 
-    if attrs.get("_control1_state_menu_wrapper", False):
-        return True
-
     cb = attrs.get("cb")
     if cb is None:
         return False
 
-    def wrapped(menu_item, orig_cb=cb):
+    original = attrs.get("_control1_state_menu_original")
+    if original is None and attrs.get("_control1_state_menu_wrapper", False):
+        defaults = getattr(cb, "__defaults__", ())
+        original = defaults[0] if defaults else cb
+    elif original is None:
+        original = cb
+
+    def wrapped(menu_item, orig_cb=original):
+        """Run Talon's callback and publish a resulting state change."""
         before = actions.tracking.control1_enabled()
         result = orig_cb(menu_item)
         after = actions.tracking.control1_enabled()
-        if not should_emit_state_change(before, after):
+        if before == after:
             return result
         _emit_control1_state(after)
         return result
 
     attrs["cb"] = wrapped
     attrs["_control1_state_menu_wrapper"] = True
+    attrs["_control1_state_menu_original"] = original
     return True
 
 
@@ -54,7 +62,7 @@ class TrackingActions:
         before = actions.tracking.control1_enabled()
         actions.next(state)
         after = actions.tracking.control1_enabled()
-        if not should_emit_state_change(before, after):
+        if before == after:
             return
         _emit_control1_state(after)
 
@@ -64,26 +72,23 @@ class Actions:
     @staticmethod
     def control1_started() -> None:
         """Hook called when control1 mouse starts."""
-        _ = 0
+        pass
 
     @staticmethod
     def control1_stopped() -> None:
         """Hook called when control1 mouse stops."""
-        _ = 0
+        pass
 
     @staticmethod
     def control1_state_changed(enabled: bool) -> None:
         """Hook called when control1 state changes."""
-        _ = enabled
+        pass
 
     @staticmethod
     def control1_state_events_start() -> None:
         """Enable control1 state events (event-driven, no poll loop)."""
         hooked = _install_menu_hook()
-        print(
-            f"control1_state_events started mode=events "
-            f"hooked={hooked}"
-        )
+        print(f"control1_state_events started mode=events hooked={hooked}")
 
     @staticmethod
     def control1_state_events_stop() -> None:
@@ -102,6 +107,7 @@ class Actions:
 
 
 def _on_ready() -> None:
+    """Install the Control Mouse menu hook after Talon initialization."""
     _install_menu_hook()
 
 

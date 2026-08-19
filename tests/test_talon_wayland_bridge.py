@@ -1,0 +1,415 @@
+import importlib.util
+import inspect
+import os
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+class FakeContext:
+    def __init__(self):
+        self.matches = ""
+
+    def action_class(self, action_namespace):
+        def decorate(cls):
+            if action_namespace == "main":
+                signature = inspect.signature(cls.key)
+                if signature.return_annotation is not inspect.Signature.empty:
+                    raise TypeError("main.key must not have a return annotation")
+            return cls
+
+        return decorate
+
+
+class FakeModule:
+    def action_class(self, cls):
+        for value in vars(cls).values():
+            if not callable(value):
+                continue
+            signature = inspect.signature(value)
+            annotations = [
+                parameter.annotation for parameter in signature.parameters.values()
+            ]
+            annotations.append(signature.return_annotation)
+            if any(isinstance(annotation, str) for annotation in annotations):
+                raise TypeError("Talon action annotations must be runtime types")
+        return cls
+
+
+class FakeApp:
+    def __init__(self):
+        self.callbacks = {}
+
+    def register(self, event, callback):
+        self.callbacks[event] = callback
+
+
+class FakeCron:
+    def __init__(self):
+        self.jobs = []
+
+    def after(self, delay, callback):
+        job = types.SimpleNamespace(delay=delay, callback=callback, cancelled=False)
+        self.jobs.append(job)
+        return job
+
+    def cancel(self, job):
+        job.cancelled = True
+
+
+class FakeActions:
+    def __init__(self):
+        self.next_calls = []
+
+    def next(self, *args):
+        self.next_calls.append(args)
+        return None
+
+
+class FakeScopeDeclaration:
+    def __init__(self, func):
+        self.func = func
+        self.update_count = 0
+
+    def update(self):
+        self.update_count += 1
+
+
+class FakeRegistry:
+    def __init__(self):
+        self.decls = types.SimpleNamespace(apps={})
+        self.callbacks = {}
+
+    def register(self, event, callback):
+        self.callbacks.setdefault(event, []).append(callback)
+
+    def unregister(self, event, callback):
+        callbacks = self.callbacks.get(event, [])
+        callbacks.remove(callback)
+
+
+def load_bridge_module():
+    root = Path(__file__).resolve().parents[1]
+    talon = types.ModuleType("talon")
+    talon.Context = FakeContext
+    talon.Module = FakeModule
+    talon.actions = FakeActions()
+    talon.app = FakeApp()
+    talon.cron = FakeCron()
+    talon.registry = FakeRegistry()
+    talon.scope = types.SimpleNamespace(
+        scopes={
+            "app": FakeScopeDeclaration(lambda: {"original": "app"}),
+            "win": FakeScopeDeclaration(lambda: {"original": "win"}),
+        }
+    )
+    path = root / "plugins" / "wayland_runtime.py"
+    spec = importlib.util.spec_from_file_location("plugins.wayland_runtime", path)
+    module = importlib.util.module_from_spec(spec)
+    old_bridge = getattr(sys, "_jm_talon_lite_wayland_bridge", None)
+    if old_bridge is not None:
+        delattr(sys, "_jm_talon_lite_wayland_bridge")
+    with patch.dict(sys.modules, {"talon": talon}):
+        spec.loader.exec_module(module)
+    return module, talon
+
+
+class TalonWaylandBridgeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module, cls.talon = load_bridge_module()
+
+    def setUp(self):
+        self.module._fallback_held_keys.clear()
+        self.module._publish_fallback_keys()
+
+    @classmethod
+    def tearDownClass(cls):
+        bridge = getattr(sys, "_jm_talon_lite_wayland_bridge", None)
+        if bridge is not None:
+            bridge.stop()
+            delattr(sys, "_jm_talon_lite_wayland_bridge")
+
+    def test_applies_window_values_and_restores_original_scope_functions(self):
+        bridge = self.module._TalonWaylandBridge()
+        original_app = self.talon.scope.scopes["app"].func
+        original_win = self.talon.scope.scopes["win"].func
+        window = self.module.Window(1, "Editor", "code", ("activated",))
+        status = types.SimpleNamespace(protocols=())
+        with (
+            patch.object(bridge.desktop, "start"),
+            patch.object(bridge.desktop, "stop"),
+            patch.object(bridge.desktop, "status", return_value=status),
+            patch.object(
+                bridge.desktop,
+                "window_context_available",
+                return_value=True,
+            ),
+            patch("builtins.print"),
+        ):
+            bridge.start()
+            generation = bridge._generation
+            bridge._queue_active_window(generation, window)
+            self.talon.cron.jobs[-1].callback()
+
+            self.assertTrue(bridge.context_available())
+            self.assertEqual(bridge._app_scope()["app"], {"code"})
+            self.assertEqual(bridge._app_scope()["name"], "Code")
+            self.assertEqual(bridge._win_scope()["title"], "Editor")
+            bridge.stop()
+        self.assertIs(self.talon.scope.scopes["app"].func, original_app)
+        self.assertIs(self.talon.scope.scopes["win"].func, original_win)
+
+    def test_start_delegates_and_warns_only_for_missing_protocols(self):
+        bridge = self.module._TalonWaylandBridge()
+        complete = (
+            ("zwp_virtual_keyboard_manager_v1", 1),
+            ("zwlr_virtual_pointer_manager_v1", 2),
+            ("zwlr_foreign_toplevel_manager_v1", 3),
+        )
+        status = types.SimpleNamespace(
+            protocols=complete,
+            running=True,
+            error=None,
+        )
+        with (
+            patch.object(bridge.desktop, "start") as start,
+            patch.object(bridge.desktop, "stop"),
+            patch.object(bridge.desktop, "status", return_value=status),
+            patch.object(
+                bridge.desktop,
+                "window_context_available",
+                return_value=True,
+            ),
+            patch.object(bridge, "_install_scope_providers") as install,
+            patch("builtins.print") as output,
+        ):
+            bridge.start()
+            bridge.start()
+            bridge.stop()
+        start.assert_called_once_with()
+        install.assert_called_once_with()
+        output.assert_not_called()
+
+    def test_start_recovers_an_autonomously_stopped_desktop(self):
+        bridge = self.module._TalonWaylandBridge()
+        bridge._started = True
+        bridge._modifier_tokens[1] = (self.module.KeyEvent(29, True),)
+        status = types.SimpleNamespace(protocols=(), running=False, error="lost")
+        with (
+            patch.object(bridge.desktop, "start") as start,
+            patch.object(bridge.desktop, "stop") as stop,
+            patch.object(bridge.desktop, "status", return_value=status),
+            patch.object(
+                bridge.desktop,
+                "window_context_available",
+                return_value=False,
+            ),
+            patch("builtins.print"),
+        ):
+            bridge.start()
+            start.assert_called_once_with()
+            stop.assert_called_once_with()
+            bridge.stop()
+
+        self.assertEqual(stop.call_count, 2)
+
+    def test_failed_stop_retains_callback_ownership_for_retry(self):
+        bridge = self.module._TalonWaylandBridge()
+        bridge._registered_declaration_callback = True
+        with (
+            patch.object(bridge.desktop, "stop"),
+            patch.object(
+                bridge,
+                "_unregister_declaration_callback",
+                side_effect=(RuntimeError("unregister failed"), None),
+            ) as unregister,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unregister failed"):
+                bridge.stop()
+            self.assertTrue(bridge._registered_declaration_callback)
+            self.assertTrue(bridge._cleanup_pending)
+            bridge.stop()
+
+        self.assertEqual(unregister.call_count, 2)
+        self.assertFalse(bridge._registered_declaration_callback)
+        self.assertFalse(bridge._cleanup_pending)
+
+    def test_failed_scope_update_is_retried_by_repeated_stop(self):
+        bridge = self.module._TalonWaylandBridge()
+        app_scope = self.talon.scope.scopes["app"]
+        win_scope = self.talon.scope.scopes["win"]
+        bridge._app_scope_decl = app_scope
+        bridge._win_scope_decl = win_scope
+        bridge._scope_originals = (app_scope.func, win_scope.func)
+        app_scope.func = bridge._app_scope_provider
+        win_scope.func = bridge._win_scope_provider
+        bridge._context_available = True
+
+        with (
+            patch.object(bridge.desktop, "stop"),
+            patch.object(
+                app_scope,
+                "update",
+                side_effect=(RuntimeError("scope update failed"), None),
+            ) as update,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "scope update failed"):
+                bridge.stop()
+            self.assertTrue(bridge._app_scope_update_pending)
+            self.assertTrue(bridge._cleanup_pending)
+            bridge.stop()
+
+        self.assertEqual(update.call_count, 2)
+        self.assertFalse(bridge._app_scope_update_pending)
+        self.assertFalse(bridge._cleanup_pending)
+
+    def test_legacy_runtime_stop_precedes_final_job_cancellation(self):
+        runtime_key = self.module._LEGACY_RUNTIME_KEY
+        job_key = self.module._LEGACY_CONTEXT_JOB_KEY
+        scopes_key = self.module._LEGACY_SCOPE_ORIGINALS_KEY
+        final_job = types.SimpleNamespace(cancelled=False)
+
+        def original_app():
+            return {"legacy": "app"}
+
+        def original_win():
+            return {"legacy": "win"}
+
+        def stop():
+            setattr(sys, job_key, final_job)
+
+        setattr(sys, runtime_key, types.SimpleNamespace(stop=stop))
+        setattr(sys, scopes_key, (original_app, original_win))
+        try:
+            self.module._retire_legacy_runtime()
+        finally:
+            for key in (runtime_key, job_key, scopes_key):
+                if hasattr(sys, key):
+                    delattr(sys, key)
+
+        self.assertTrue(final_job.cancelled)
+        self.assertIs(self.talon.scope.scopes["app"].func, original_app)
+        self.assertIs(self.talon.scope.scopes["win"].func, original_win)
+
+    def test_start_failure_rolls_back_desktop_and_callbacks(self):
+        bridge = self.module._TalonWaylandBridge()
+        with (
+            patch.object(bridge.desktop, "start"),
+            patch.object(bridge.desktop, "stop") as stop,
+            patch.object(
+                bridge.desktop,
+                "status",
+                side_effect=RuntimeError("status failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "status failed"):
+                bridge.start()
+
+        stop.assert_called_once_with()
+        self.assertFalse(bridge._started)
+        self.assertFalse(bridge.context_available())
+        self.assertEqual(self.talon.registry.callbacks.get("update_decls", []), [])
+
+    def test_stale_window_job_does_not_restore_scopes_after_stop(self):
+        bridge = self.module._TalonWaylandBridge()
+        status = types.SimpleNamespace(protocols=(), running=True, error=None)
+        with (
+            patch.object(bridge.desktop, "start"),
+            patch.object(bridge.desktop, "stop"),
+            patch.object(bridge.desktop, "status", return_value=status),
+            patch.object(
+                bridge.desktop,
+                "window_context_available",
+                return_value=True,
+            ),
+            patch("builtins.print"),
+        ):
+            bridge.start()
+            bridge._queue_active_window(
+                bridge._generation,
+                self.module.Window(1, "Editor", "code", ("activated",)),
+            )
+            job = self.talon.cron.jobs[-1]
+            bridge.stop()
+            job.callback()
+        self.assertTrue(job.cancelled)
+        self.assertFalse(bridge.context_available())
+
+    def test_main_key_falls_back_only_when_native_keyboard_is_unavailable(self):
+        bridge = self.module._bridge
+        self.talon.actions.next_calls.clear()
+        with (
+            patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland"}, clear=True),
+            patch.object(bridge.desktop, "keyboard_available", return_value=False),
+            patch.object(bridge.desktop, "send_key") as send_key,
+        ):
+            self.module.MainActions.key("a")
+        send_key.assert_not_called()
+        self.assertEqual(self.talon.actions.next_calls, [("a",)])
+
+        self.talon.actions.next_calls.clear()
+        with (
+            patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland"}, clear=True),
+            patch.object(bridge.desktop, "keyboard_available", return_value=True),
+            patch.object(bridge.desktop, "send_key") as send_key,
+        ):
+            self.module.MainActions.key("a")
+        send_key.assert_called_once_with("a")
+        self.assertEqual(self.talon.actions.next_calls, [])
+
+    def test_fallback_key_hold_stays_with_fallback_until_release(self):
+        bridge = self.module._bridge
+        self.talon.actions.next_calls.clear()
+        with (
+            patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland"}, clear=True),
+            patch.object(bridge.desktop, "keyboard_available", return_value=False),
+        ):
+            self.module.MainActions.key("ctrl:down")
+
+        with (
+            patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland"}, clear=True),
+            patch.object(bridge.desktop, "keyboard_available", return_value=True),
+            patch.object(bridge.desktop, "send_key") as send_key,
+        ):
+            self.module.MainActions.key("a")
+            self.module.MainActions.key("ctrl:up")
+            self.module.MainActions.key("b")
+
+        self.assertEqual(
+            self.talon.actions.next_calls,
+            [("ctrl:down",), ("a",), ("ctrl:up",)],
+        )
+        send_key.assert_called_once_with("b")
+
+    def test_temporary_modifier_tokens_release_exactly_once(self):
+        bridge = self.module._TalonWaylandBridge()
+        pressed = (types.SimpleNamespace(keycode=29, pressed=True),)
+        with (
+            patch.object(
+                bridge.desktop,
+                "press_temporary_modifiers",
+                return_value=pressed,
+            ),
+            patch.object(
+                bridge.desktop,
+                "release_temporary_modifiers",
+            ) as release,
+        ):
+            token = bridge.begin_temporary_modifiers("ctrl")
+            bridge.end_temporary_modifiers(token)
+            bridge.end_temporary_modifiers(token)
+
+        release.assert_called_once_with(pressed)
+
+    def test_wayland_detection_uses_standard_session_environment(self):
+        with patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland"}, clear=True):
+            self.assertTrue(self.module._is_wayland())
+        with patch.dict(os.environ, {"XDG_SESSION_TYPE": "x11"}, clear=True):
+            self.assertFalse(self.module._is_wayland())
+
+
+if __name__ == "__main__":
+    unittest.main()

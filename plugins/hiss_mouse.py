@@ -1,6 +1,8 @@
-from talon import Context, Module, actions, app, settings
+"""Drive Control Mouse and clicking from Talon hiss and pop events."""
 
-from .shared.pure_utils import resolve_toggle_state
+import sys
+
+from talon import Context, Module, actions, app, settings
 
 ctx = Context()
 mod = Module()
@@ -12,27 +14,48 @@ mod.setting(
     desc="Enable hiss mouse on Talon startup.",
 )
 
-_hiss_mouse_enabled = False
+_STATE_KEY = "_jm_talon_lite_hiss_mouse_enabled"
+_had_retained_state = hasattr(sys, _STATE_KEY) or "_hiss_mouse_enabled" in globals()
+_hiss_mouse_enabled = bool(
+    getattr(sys, _STATE_KEY, globals().get("_hiss_mouse_enabled", False))
+)
+
+
+def _publish_state() -> None:
+    """Retain manual Hiss Mouse state across Talon script reloads."""
+    setattr(sys, _STATE_KEY, _hiss_mouse_enabled)
+
+
+if _had_retained_state:
+    _publish_state()
 
 
 def _forward_left_click() -> None:
+    """Click normally, or release an active drag without another click."""
+    if actions.user.mouse_drag_end():
+        return
     actions.mouse_click(0)
 
 
 def _enable_hiss_mouse() -> None:
+    """Establish the enabled Hiss Mouse state."""
     global _hiss_mouse_enabled
     _hiss_mouse_enabled = True
+    _publish_state()
 
 
 def _disable_hiss_mouse() -> None:
+    """Disable Hiss Mouse and stop Control Mouse when active."""
     global _hiss_mouse_enabled
     _hiss_mouse_enabled = False
+    _publish_state()
     if not actions.tracking.control1_enabled():
         return
     actions.tracking.control1_toggle(False)
 
 
 def _set_hiss_mouse_enabled(enabled: bool) -> None:
+    """Establish the requested Hiss Mouse state idempotently."""
     if enabled:
         _enable_hiss_mouse()
         return
@@ -43,6 +66,7 @@ def _set_hiss_mouse_enabled(enabled: bool) -> None:
 class UserActions:
     @staticmethod
     def noise_trigger_hiss(active: bool):
+        """Start or stop Control Mouse while an enabled hiss is active."""
         if not _hiss_mouse_enabled:
             return
         if active:
@@ -52,6 +76,7 @@ class UserActions:
 
     @staticmethod
     def noise_trigger_pop():
+        """Click once for an enabled Talon pop event."""
         if not _hiss_mouse_enabled:
             return
         _forward_left_click()
@@ -72,7 +97,7 @@ class Actions:
     @staticmethod
     def hiss_mouse_toggle(state: bool | None = None) -> None:
         """Toggle hiss mouse behavior."""
-        target = resolve_toggle_state(_hiss_mouse_enabled, state)
+        target = not _hiss_mouse_enabled if state is None else bool(state)
         _set_hiss_mouse_enabled(target)
 
     @staticmethod
@@ -82,9 +107,11 @@ class Actions:
 
 
 def _on_ready() -> None:
-    if not settings.get("user.hiss_mouse_autostart"):
+    """Enable Hiss Mouse when its Talon autostart setting is set."""
+    if _had_retained_state or not settings.get("user.hiss_mouse_autostart"):
         return
     actions.user.hiss_mouse_enable()
 
 
+_publish_state()
 app.register("ready", _on_ready)

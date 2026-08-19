@@ -1,480 +1,461 @@
-"""Talon key specs and compositor-provided XKB keymaps."""
+"""Virtual-keyboard protocol lifecycle and key-event execution."""
 
 from __future__ import annotations
 
-import ctypes
-from dataclasses import dataclass
-from itertools import combinations
-import mmap
 import os
-import tempfile
+import threading
+from collections.abc import Callable
+from typing import Any
 
-
-KEY_MAX = 0x2FF
-KEYMAP_FORMAT_XKB_V1 = 1
-MAX_KEYMAP_SIZE = 16 * 1024 * 1024
-
-_XKB_KEY_UP = 0
-_XKB_KEY_DOWN = 1
-_XKB_KEYSYM_CASE_INSENSITIVE = 1
-_XKB_STATE_MODS_DEPRESSED = 1 << 0
-_XKB_STATE_MODS_LATCHED = 1 << 1
-_XKB_STATE_MODS_LOCKED = 1 << 2
-_XKB_STATE_LAYOUT_EFFECTIVE = 1 << 7
-_XKB_STATE_MODIFIERS = (
-    _XKB_STATE_MODS_DEPRESSED
-    | _XKB_STATE_MODS_LATCHED
-    | _XKB_STATE_MODS_LOCKED
+from .connection import WaylandConnection, monotonic_timestamp_ms, run_cleanup_steps
+from .errors import CapabilityUnavailable
+from .key_spec import (
+    KeyEvent,
+    KeyStroke,
+    ResolvedStroke,
+    modifier_chord,
+    parse_key_spec,
+    plan_key_events,
+)
+from .seats import SeatCapability, SeatRegistry
+from .xkb import (
+    KEY_MAX,
+    KEYMAP_FORMAT_XKB_V1,
+    XkbKeymap,
+    create_keymap_fd,
+    read_keymap_fd,
+    validate_keycode,
 )
 
-_MODIFIER_KEYSYMS = {
-    "ctrl": "Control_L",
-    "alt": "Alt_L",
-    "shift": "Shift_L",
-    "super": "Super_L",
-}
-_LEVEL_MODIFIER_KEYSYMS = (
-    "Shift_L",
-    "ISO_Level3_Shift",
-    "ISO_Level5_Shift",
-    "Mode_switch",
-)
-_KEYSYM_ALIASES = {
-    "esc": "Escape",
-    "enter": "Return",
-    "space": "space",
-    "backspace": "BackSpace",
-    "delete": "Delete",
-    "insert": "Insert",
-    "home": "Home",
-    "end": "End",
-    "pageup": "Page_Up",
-    "pagedown": "Page_Down",
-    "left": "Left",
-    "right": "Right",
-    "up": "Up",
-    "down": "Down",
-    "menu": "Menu",
-    "printscr": "Print",
-    "minus": "-",
-    "volup": "XF86AudioRaiseVolume",
-    "voldown": "XF86AudioLowerVolume",
-    "mute": "XF86AudioMute",
-    "play": "XF86AudioPlay",
-    "play_pause": "XF86AudioPlay",
-    "next": "XF86AudioNext",
-    "prev": "XF86AudioPrev",
-}
-_KEYPAD_KEY_NAMES = {
-    **{str(number): f"KP{number}" for number in range(10)},
-    "decimal": "KPDL",
-    "plus": "KPAD",
-    "minus": "KPSU",
-    "multiply": "KPMU",
-    "divide": "KPDV",
-    "equals": "KPEQ",
-    "clear": "KP5",
-    "enter": "KPEN",
-}
-_xkb_library = None
+_KEY_RELEASED = 0
+_KEY_PRESSED = 1
 
 
-@dataclass(frozen=True)
-class KeyStroke:
-    modifiers: tuple[str, ...]
-    key: str | None
-    action: str
-    repeat: int
+class VirtualKeyboard:
+    """Own zwp_virtual_keyboard_manager_v1 and mirrored XKB state."""
 
-
-def parse_key_spec(key_spec: str) -> tuple[KeyStroke, ...]:
-    """Parse Talon's space-separated key syntax."""
-    if not isinstance(key_spec, str):
-        raise TypeError("Talon key spec must be a string")
-
-    strokes = []
-    for token in key_spec.split():
-        base, action, repeat = _parse_suffix(token)
-        parts = base.split("-")
-        modifiers = []
-        while parts and parts[0] in _MODIFIER_KEYSYMS:
-            modifier = parts.pop(0)
-            if modifier not in modifiers:
-                modifiers.append(modifier)
-        key = "-".join(parts) or None
-        if key is None and not modifiers:
-            raise ValueError(f"Invalid Talon key: {token!r}")
-        strokes.append(KeyStroke(tuple(modifiers), key, action, repeat))
-    return tuple(strokes)
-
-
-def _parse_suffix(token: str) -> tuple[str, str, int]:
-    if ":" not in token:
-        return token, "tap", 1
-    base, suffix = token.rsplit(":", 1)
-    if suffix in ("down", "up"):
-        if not base:
-            raise ValueError(f"Invalid Talon key: {token!r}")
-        return base, suffix, 1
-    if suffix.isdigit():
-        repeat = int(suffix)
-        if not base or repeat < 1:
-            raise ValueError(f"Invalid Talon key repeat: {token!r}")
-        return base, "tap", repeat
-    return token, "tap", 1
-
-
-class XkbKeymap:
-    """Resolve keysyms and track modifiers for one XKB-v1 keymap."""
+    interface_name = "zwp_virtual_keyboard_manager_v1"
+    multiple = False
 
     def __init__(
-        self, data: bytes, locked_modifiers: int = 0, group: int = 0
-    ):
-        if not isinstance(data, bytes) or not data.endswith(b"\0"):
-            raise ValueError("XKB-v1 keymap must be null-terminated bytes")
+        self,
+        connection: WaylandConnection,
+        seats: SeatRegistry,
+        timestamp_ms: Callable[[], int] = monotonic_timestamp_ms,
+    ) -> None:
+        """Create an unavailable keyboard without performing protocol I/O."""
+        self._connection = connection
+        self._seats = seats
+        self._timestamp_ms = timestamp_ms
+        self._lock = threading.Lock()
+        self._manager_name: int | None = None
+        self._manager: Any = None
+        self._source_seat_id: int | None = None
+        self._source_seat_version = 0
+        self._source_keyboard: Any = None
+        self._source_keymap: bytes | None = None
+        self._locked_modifiers = 0
+        self._group = 0
+        self._keyboard: Any = None
+        self._keyboard_keymap: bytes | None = None
+        self._xkb: XkbKeymap | None = None
+        self._held_keys: list[int] = []
+        self._unsubscribe_seats = seats.subscribe(self._on_seat_changed)
 
-        self._lib = _load_xkbcommon()
-        self._context = self._lib.xkb_context_new(0)
-        self._keymap = None
-        self._state = None
-        self._pressed_keys = []
-        self._locked_modifiers = _validate_uint32(
-            locked_modifiers, "XKB locked modifiers"
-        )
-        self._group = _validate_uint32(group, "XKB layout group")
-        if not self._context:
-            raise RuntimeError("Could not create an XKB context")
-        try:
-            self._keymap = self._lib.xkb_keymap_new_from_string(
-                self._context,
-                data,
-                KEYMAP_FORMAT_XKB_V1,
-                0,
+    def bind(self, registry: Any, name: int, version: int, interface: type) -> int:
+        """Bind the virtual-keyboard manager and create its child when ready."""
+        negotiated = min(version, interface.version)
+        manager = registry.bind(name, interface, negotiated)
+        with self._lock:
+            self._manager_name = name
+            self._manager = manager
+        self._maybe_create_virtual()
+        return negotiated
+
+    def remove(self, name: int) -> None:
+        """Destroy the virtual keyboard before releasing its removed manager."""
+        with self._lock:
+            if name != self._manager_name:
+                return
+            manager = self._manager
+            self._manager_name = None
+            self._manager = None
+        run_cleanup_steps(
+            (
+                ("virtual keyboard", self._destroy_virtual),
+                ("virtual keyboard manager", lambda: self._destroy_manager(manager)),
             )
-            if not self._keymap:
-                raise ValueError("Could not parse the compositor XKB keymap")
-            self._state = self._new_state()
-            self._keys, self._modifiers = self._build_key_index()
-        except Exception:
-            self.close()
-            raise
+        )
+
+    def ready(self) -> None:
+        """Attach to the selected source keyboard after initial synchronization."""
+        self._sync_source_keyboard()
+        self._maybe_create_virtual()
 
     def close(self) -> None:
-        if self._state:
-            self._lib.xkb_state_unref(self._state)
-            self._state = None
-        if self._keymap:
-            self._lib.xkb_keymap_unref(self._keymap)
-            self._keymap = None
-        if self._context:
-            self._lib.xkb_context_unref(self._context)
-            self._context = None
-
-    def resolve_key(self, name: str) -> tuple[int, tuple[int, ...]]:
-        normalized = name.lower()
-        if normalized.startswith("keypad_"):
-            key_name = _KEYPAD_KEY_NAMES.get(normalized.removeprefix("keypad_"))
-            if key_name is None:
-                raise ValueError(f"Unknown Talon key: {name!r}")
-            xkb_keycode = self._lib.xkb_keymap_key_by_name(
-                self._keymap, key_name.encode("ascii")
+        """Release virtual and source keyboards before destroying the manager."""
+        with self._lock:
+            manager = self._manager
+            self._manager_name = None
+            self._manager = None
+        run_cleanup_steps(
+            (
+                ("virtual keyboard", self._destroy_virtual),
+                ("source keyboard", self._release_source_keyboard),
+                ("virtual keyboard manager", lambda: self._destroy_manager(manager)),
             )
-            if xkb_keycode != 0xFFFFFFFF:
-                return validate_keycode(xkb_keycode - 8), ()
-            raise ValueError(f"Key {name!r} is not available in the active keymap")
-
-        keysym = self._keysym(name)
-        resolved = self._keys.get(keysym)
-        if resolved is None:
-            raise ValueError(f"Key {name!r} is not available in the active keymap")
-        return resolved
-
-    def resolve_modifier(self, name: str) -> int:
-        try:
-            return self._modifiers[name]
-        except KeyError as exc:
-            raise ValueError(
-                f"Modifier {name!r} is not available in the active keymap"
-            ) from exc
-
-    def modifiers(self) -> tuple[int, int, int, int]:
-        return self._serialize_modifiers()
-
-    def set_external_state(
-        self, locked_modifiers: int, group: int
-    ) -> tuple[int, int, int, int] | None:
-        """Apply source-keyboard lock and layout state without physical holds."""
-        locked_modifiers = _validate_uint32(
-            locked_modifiers, "XKB locked modifiers"
         )
-        group = _validate_uint32(group, "XKB layout group")
-        if (
-            locked_modifiers == self._locked_modifiers
-            and group == self._group
-        ):
-            return None
 
-        self._locked_modifiers = locked_modifiers
-        self._group = group
-        state = self._new_state()
-        try:
-            for keycode in self._pressed_keys:
-                self._lib.xkb_state_update_key(
-                    state, keycode + 8, _XKB_KEY_DOWN
-                )
-        except Exception:
-            self._lib.xkb_state_unref(state)
-            raise
-        old_state = self._state
-        self._state = state
-        self._lib.xkb_state_unref(old_state)
-        self._keys, self._modifiers = self._build_key_index()
-        return self._serialize_modifiers()
+    def available(self) -> bool:
+        """Return whether a virtual keyboard with an active keymap exists."""
+        with self._lock:
+            return (
+                self._keyboard is not None
+                and not self._keyboard.destroyed
+                and self._keyboard_keymap is not None
+                and self._xkb is not None
+            )
 
-    def update_key(
-        self, keycode: int, pressed: bool
-    ) -> tuple[int, int, int, int] | None:
-        changed = self._lib.xkb_state_update_key(
-            self._state,
-            validate_keycode(keycode) + 8,
-            _XKB_KEY_DOWN if pressed else _XKB_KEY_UP,
+    def send(self, key_spec: str, *, timeout: float = 1.0) -> None:
+        """Parse and send a Talon key specification through the owner thread."""
+        strokes = parse_key_spec(key_spec)
+        if strokes:
+            self._connection.execute(lambda: self._emit_strokes(strokes), timeout)
+
+    def _on_seat_changed(self) -> None:
+        """Synchronize source and virtual keyboards after selected-seat changes."""
+        self._sync_source_keyboard()
+        self._maybe_create_virtual()
+
+    def _sync_source_keyboard(self) -> None:
+        """Attach to the selected seat's keyboard capability when available."""
+        seat = self._seats.selected()
+        usable = seat is not None and bool(seat.capabilities & SeatCapability.KEYBOARD)
+        target_id = seat.id if usable else None
+        with self._lock:
+            current_id = self._source_seat_id
+            source = self._source_keyboard
+        if target_id == current_id and source is not None:
+            return
+        run_cleanup_steps(
+            (
+                ("virtual keyboard", self._destroy_virtual),
+                ("source keyboard", self._release_source_keyboard),
+            )
         )
-        if pressed:
-            if keycode not in self._pressed_keys:
-                self._pressed_keys.append(keycode)
+        if not usable or seat is None or not self._connection.initialized:
+            return
+
+        source = seat.proxy.get_keyboard()
+        with self._lock:
+            self._source_seat_id = seat.id
+            self._source_seat_version = seat.version
+            self._source_keyboard = source
+            self._source_keymap = None
+            self._locked_modifiers = 0
+            self._group = 0
+        source.dispatcher["keymap"] = self._connection.guard(self._on_keymap)
+        source.dispatcher["modifiers"] = self._connection.guard(self._on_modifiers)
+
+    def _release_source_keyboard(self) -> None:
+        """Release the selected seat's source keyboard idempotently."""
+        with self._lock:
+            source = self._source_keyboard
+            version = self._source_seat_version
+            self._source_seat_id = None
+            self._source_seat_version = 0
+            self._source_keyboard = None
+            self._source_keymap = None
+            self._locked_modifiers = 0
+            self._group = 0
+        if source is None or source.destroyed:
+            return
+        if version >= 3:
+            source.release()
         else:
-            if keycode in self._pressed_keys:
-                self._pressed_keys.remove(keycode)
-        if not changed & (_XKB_STATE_MODIFIERS | _XKB_STATE_LAYOUT_EFFECTIVE):
-            return None
-        modifiers = self._serialize_modifiers()
-        if (
-            modifiers[2] != self._locked_modifiers
-            or modifiers[3] != self._group
-        ):
-            self._locked_modifiers = modifiers[2]
-            self._group = modifiers[3]
-            self._keys, self._modifiers = self._build_key_index()
-        return modifiers
+            source._destroy()
 
-    def _serialize_modifiers(self) -> tuple[int, int, int, int]:
-        return (
-            self._lib.xkb_state_serialize_mods(
-                self._state, _XKB_STATE_MODS_DEPRESSED
-            ),
-            self._lib.xkb_state_serialize_mods(
-                self._state, _XKB_STATE_MODS_LATCHED
-            ),
-            self._lib.xkb_state_serialize_mods(
-                self._state, _XKB_STATE_MODS_LOCKED
-            ),
-            self._lib.xkb_state_serialize_layout(
-                self._state, _XKB_STATE_LAYOUT_EFFECTIVE
-            ),
-        )
+    @staticmethod
+    def _destroy_manager(manager: Any) -> None:
+        """Destroy one virtual-keyboard manager when it remains live."""
+        if manager is not None and not manager.destroyed:
+            manager.destroy()
 
-    def _new_state(self):
-        state = self._lib.xkb_state_new(self._keymap)
-        if not state:
-            raise RuntimeError("Could not create XKB keyboard state")
-        self._lib.xkb_state_update_mask(
-            state,
-            0,
-            0,
-            self._locked_modifiers,
-            0,
-            0,
-            self._group,
-        )
-        return state
-
-    def _build_key_index(
+    def _on_keymap(
         self,
-    ) -> tuple[dict[int, tuple[int, tuple[int, ...]]], dict[str, int]]:
-        minimum = self._lib.xkb_keymap_min_keycode(self._keymap)
-        maximum = self._lib.xkb_keymap_max_keycode(self._keymap)
-        base_state = self._new_state()
+        source: Any,
+        format: int,
+        fd: int,
+        size: int,
+    ) -> None:
+        """Copy a selected source keymap and apply it to the virtual keyboard."""
+        with self._lock:
+            current = source is self._source_keyboard
+        if not current or self._connection.stopping:
+            if fd >= 0:
+                os.close(fd)
+            return
+        if format != KEYMAP_FORMAT_XKB_V1:
+            if fd >= 0:
+                os.close(fd)
+            with self._lock:
+                if source is self._source_keyboard:
+                    self._source_keymap = None
+            self._destroy_virtual()
+            return
+
+        keymap = read_keymap_fd(fd, size)
+        with self._lock:
+            if source is not self._source_keyboard:
+                return
+            unchanged = keymap == self._source_keymap
+            self._source_keymap = keymap
+            keyboard = self._keyboard
+        if unchanged:
+            self._maybe_create_virtual()
+            return
+        if keyboard is None:
+            self._maybe_create_virtual()
+            return
+        self._apply_keymap(keyboard)
+
+    def _on_modifiers(
+        self,
+        source: Any,
+        _serial: int,
+        _depressed: int,
+        _latched: int,
+        locked: int,
+        group: int,
+    ) -> None:
+        """Mirror source lock and layout state while excluding depressed keys."""
+        with self._lock:
+            if source is not self._source_keyboard:
+                return
+            self._locked_modifiers = locked
+            self._group = group
+            keyboard = self._keyboard
+            xkb = self._xkb
+        if keyboard is None or xkb is None:
+            self._maybe_create_virtual()
+            return
+        modifiers = xkb.set_external_state(locked, group)
+        if modifiers is not None:
+            keyboard.modifiers(*modifiers)
+
+    def _maybe_create_virtual(self) -> None:
+        """Create a virtual keyboard once manager, source, and keymap are ready."""
+        if not self._connection.initialized or self._connection.stopping:
+            return
+        seat = self._seats.selected()
+        with self._lock:
+            manager = self._manager
+            source = self._source_keyboard
+            keymap = self._source_keymap
+            keyboard = self._keyboard
+            source_seat_id = self._source_seat_id
+        if (
+            manager is None
+            or source is None
+            or source.destroyed
+            or keymap is None
+            or keyboard is not None
+            or seat is None
+            or seat.id != source_seat_id
+        ):
+            return
+        keyboard = manager.create_virtual_keyboard(seat.proxy)
+        with self._lock:
+            self._keyboard = keyboard
+            self._keyboard_keymap = None
         try:
-            base_keys = {
-                self._lib.xkb_state_key_get_one_sym(base_state, keycode): keycode - 8
-                for keycode in range(minimum, maximum + 1)
-                if keycode >= 9
-            }
-        finally:
-            self._lib.xkb_state_unref(base_state)
+            self._apply_keymap(keyboard)
+        except Exception as exc:
+            with self._lock:
+                if self._keyboard is keyboard:
+                    self._keyboard = None
+                    self._keyboard_keymap = None
+            try:
+                if not keyboard.destroyed:
+                    keyboard.destroy()
+            except Exception as cleanup_error:
+                exc.add_note(
+                    "Virtual keyboard rollback also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
-        modifiers = {}
-        for name, keysym_name in _MODIFIER_KEYSYMS.items():
-            keycode = base_keys.get(self._named_keysym(keysym_name))
-            if keycode is not None:
-                modifiers[name] = keycode
+    def _apply_keymap(self, keyboard: Any) -> None:
+        """Replace XKB state and send the selected keymap to a virtual keyboard."""
+        with self._lock:
+            keymap = self._source_keymap
+            locked = self._locked_modifiers
+            group = self._group
+            if self._keyboard is not keyboard or self._keyboard_keymap == keymap:
+                return
+            self._keyboard_keymap = None
+        if keymap is None:
+            raise RuntimeError("Selected Wayland seat has no XKB-v1 keymap")
+        xkb = XkbKeymap(keymap, locked_modifiers=locked, group=group)
+        try:
+            self._release_held_keys(keyboard)
+            fd = create_keymap_fd(keymap)
+            try:
+                keyboard.keymap(KEYMAP_FORMAT_XKB_V1, fd, len(keymap))
+            finally:
+                os.close(fd)
+            modifiers = xkb.modifiers()
+            if any(modifiers):
+                keyboard.modifiers(*modifiers)
+        except Exception:
+            xkb.close()
+            raise
+        with self._lock:
+            old_xkb = self._xkb
+            self._xkb = xkb
+            if self._keyboard is keyboard:
+                self._keyboard_keymap = keymap
+        if old_xkb is not None:
+            old_xkb.close()
 
-        level_modifiers = []
-        for keysym_name in _LEVEL_MODIFIER_KEYSYMS:
-            keycode = base_keys.get(self._named_keysym(keysym_name))
-            if keycode is not None and keycode not in level_modifiers:
-                level_modifiers.append(keycode)
-
-        keys = {}
-        for count in range(len(level_modifiers) + 1):
-            for active_modifiers in combinations(level_modifiers, count):
-                state = self._new_state()
+    def _destroy_virtual(self) -> None:
+        """Release held keys and destroy virtual keyboard state idempotently."""
+        with self._lock:
+            keyboard = self._keyboard
+            xkb = self._xkb
+            self._keyboard = None
+            self._keyboard_keymap = None
+        if keyboard is None:
+            self._held_keys.clear()
+            if xkb is not None:
+                xkb.close()
+                with self._lock:
+                    if self._xkb is xkb:
+                        self._xkb = None
+            return
+        try:
+            try:
+                if not keyboard.destroyed:
+                    self._release_held_keys(keyboard)
+            except Exception as release_error:
                 try:
-                    for keycode in active_modifiers:
-                        self._lib.xkb_state_update_key(
-                            state, keycode + 8, _XKB_KEY_DOWN
-                        )
-                    for xkb_keycode in range(minimum, maximum + 1):
-                        if xkb_keycode < 9:
-                            continue
-                        keysym = self._lib.xkb_state_key_get_one_sym(
-                            state, xkb_keycode
-                        )
-                        if keysym:
-                            keys.setdefault(
-                                keysym,
-                                (xkb_keycode - 8, active_modifiers),
-                            )
-                finally:
-                    self._lib.xkb_state_unref(state)
-        return keys, modifiers
+                    if not keyboard.destroyed:
+                        keyboard.destroy()
+                except Exception as destroy_error:
+                    release_error.add_note(
+                        "Virtual keyboard destroy also failed: "
+                        f"{type(destroy_error).__name__}: {destroy_error}"
+                    )
+                raise
+            if not keyboard.destroyed:
+                keyboard.destroy()
+        finally:
+            self._held_keys.clear()
+            if xkb is not None:
+                xkb.close()
+            with self._lock:
+                if self._xkb is xkb:
+                    self._xkb = None
 
-    def _keysym(self, name: str) -> int:
-        if len(name) == 1:
-            keysym = self._lib.xkb_utf32_to_keysym(ord(name))
-        else:
-            normalized = name.lower()
-            keysym_name = _KEYSYM_ALIASES.get(normalized, name)
-            if len(keysym_name) == 1:
-                keysym = self._lib.xkb_utf32_to_keysym(ord(keysym_name))
+    def _require_keyboard(self) -> tuple[Any, XkbKeymap]:
+        """Return active protocol and XKB objects or raise a capability error."""
+        with self._lock:
+            keyboard = self._keyboard
+            keymap = self._keyboard_keymap
+            xkb = self._xkb
+        if keyboard is None or keyboard.destroyed or keymap is None or xkb is None:
+            raise CapabilityUnavailable("Wayland virtual keyboard is not available")
+        return keyboard, xkb
+
+    def _resolve_strokes(
+        self,
+        strokes: tuple[KeyStroke, ...],
+        xkb: XkbKeymap,
+    ) -> tuple[ResolvedStroke, ...]:
+        """Resolve every stroke before allowing any keyboard side effect."""
+        resolved = []
+        for stroke in strokes:
+            modifiers = [xkb.resolve_modifier(name) for name in stroke.modifiers]
+            keycode = None
+            if stroke.key is not None:
+                keycode, implicit = xkb.resolve_key(stroke.key)
+                modifiers.extend(implicit)
+            resolved.append(
+                ResolvedStroke(
+                    tuple(dict.fromkeys(modifiers)),
+                    keycode,
+                    stroke.action,
+                    stroke.repeat,
+                )
+            )
+        return tuple(resolved)
+
+    def _emit_strokes(self, strokes: tuple[KeyStroke, ...]) -> tuple[KeyEvent, ...]:
+        """Resolve and emit strokes, returning the applied transition plan."""
+        keyboard, xkb = self._require_keyboard()
+        resolved = self._resolve_strokes(strokes, xkb)
+        plan = plan_key_events(resolved, frozenset(self._held_keys))
+        for event in plan.events:
+            self._send_event(keyboard, event)
+        return plan.events
+
+    def _release_pressed_events(self, events: tuple[KeyEvent, ...]) -> None:
+        """Release only key presses introduced by a completed transition plan."""
+        keyboard, _xkb = self._require_keyboard()
+        for event in reversed(events):
+            if event.pressed:
+                self._send_event(keyboard, KeyEvent(event.keycode, False))
+
+    def _send_event(self, keyboard: Any, event: KeyEvent) -> None:
+        """Emit one key transition and update actual held and modifier state."""
+        keycode = validate_keycode(event.keycode)
+        if (keycode in self._held_keys) == event.pressed:
+            return
+        try:
+            keyboard.key(
+                self._timestamp_ms(),
+                keycode,
+                _KEY_PRESSED if event.pressed else _KEY_RELEASED,
+            )
+            if event.pressed:
+                self._held_keys.append(keycode)
             else:
-                keysym = self._named_keysym(keysym_name)
-        if not keysym:
-            raise ValueError(f"Unknown Talon key: {name!r}")
-        return keysym
+                self._held_keys.remove(keycode)
+            with self._lock:
+                xkb = self._xkb
+            if xkb is not None:
+                modifiers = xkb.update_key(keycode, event.pressed)
+                if modifiers is not None:
+                    keyboard.modifiers(*modifiers)
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise
 
-    def _named_keysym(self, name: str) -> int:
-        return self._lib.xkb_keysym_from_name(
-            name.encode("ascii"), _XKB_KEYSYM_CASE_INSENSITIVE
+    def _release_held_keys(self, keyboard: Any) -> None:
+        """Release held keys in reverse press order."""
+        run_cleanup_steps(
+            (
+                (
+                    f"keycode {keycode}",
+                    lambda keycode=keycode: self._send_event(
+                        keyboard,
+                        KeyEvent(keycode, False),
+                    ),
+                )
+                for keycode in reversed(tuple(self._held_keys))
+            )
         )
 
 
-def _load_xkbcommon():
-    global _xkb_library
-    if _xkb_library is not None:
-        return _xkb_library
-
-    lib = ctypes.CDLL("libxkbcommon.so.0")
-    void_pointer = ctypes.c_void_p
-    uint32_pointer = ctypes.c_uint32
-
-    lib.xkb_context_new.argtypes = [ctypes.c_int]
-    lib.xkb_context_new.restype = void_pointer
-    lib.xkb_context_unref.argtypes = [void_pointer]
-    lib.xkb_context_unref.restype = None
-    lib.xkb_keymap_new_from_string.argtypes = [
-        void_pointer,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_int,
-    ]
-    lib.xkb_keymap_new_from_string.restype = void_pointer
-    lib.xkb_keymap_unref.argtypes = [void_pointer]
-    lib.xkb_keymap_unref.restype = None
-    lib.xkb_keymap_min_keycode.argtypes = [void_pointer]
-    lib.xkb_keymap_min_keycode.restype = uint32_pointer
-    lib.xkb_keymap_max_keycode.argtypes = [void_pointer]
-    lib.xkb_keymap_max_keycode.restype = uint32_pointer
-    lib.xkb_keymap_key_by_name.argtypes = [void_pointer, ctypes.c_char_p]
-    lib.xkb_keymap_key_by_name.restype = uint32_pointer
-    lib.xkb_state_new.argtypes = [void_pointer]
-    lib.xkb_state_new.restype = void_pointer
-    lib.xkb_state_unref.argtypes = [void_pointer]
-    lib.xkb_state_unref.restype = None
-    lib.xkb_state_key_get_one_sym.argtypes = [void_pointer, uint32_pointer]
-    lib.xkb_state_key_get_one_sym.restype = uint32_pointer
-    lib.xkb_state_update_key.argtypes = [
-        void_pointer,
-        uint32_pointer,
-        ctypes.c_int,
-    ]
-    lib.xkb_state_update_key.restype = ctypes.c_int
-    lib.xkb_state_update_mask.argtypes = [
-        void_pointer,
-        uint32_pointer,
-        uint32_pointer,
-        uint32_pointer,
-        uint32_pointer,
-        uint32_pointer,
-        uint32_pointer,
-    ]
-    lib.xkb_state_update_mask.restype = ctypes.c_int
-    lib.xkb_state_serialize_mods.argtypes = [void_pointer, ctypes.c_int]
-    lib.xkb_state_serialize_mods.restype = uint32_pointer
-    lib.xkb_state_serialize_layout.argtypes = [void_pointer, ctypes.c_int]
-    lib.xkb_state_serialize_layout.restype = uint32_pointer
-    lib.xkb_keysym_from_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
-    lib.xkb_keysym_from_name.restype = uint32_pointer
-    lib.xkb_utf32_to_keysym.argtypes = [uint32_pointer]
-    lib.xkb_utf32_to_keysym.restype = uint32_pointer
-
-    _xkb_library = lib
-    return lib
-
-
-def _validate_uint32(value: int, label: str) -> int:
-    if type(value) is not int:
-        raise TypeError(f"{label} must be an integer")
-    if not 0 <= value <= 0xFFFFFFFF:
-        raise ValueError(f"{label} must fit an unsigned 32-bit integer")
-    return value
-
-
-def validate_keycode(keycode: int) -> int:
-    """Return a supported Linux evdev keycode."""
-    if type(keycode) is not int:
-        raise TypeError("Keyboard keycode must be an integer")
-    if not 1 <= keycode <= KEY_MAX:
-        raise ValueError(f"Keyboard keycode must be between 1 and {KEY_MAX}")
-    return keycode
-
-
-def read_keymap_fd(fd: int, size: int) -> bytes:
-    """Copy an XKB-v1 keymap and close the received Wayland file descriptor."""
-    try:
-        if type(size) is not int:
-            raise TypeError("Keyboard keymap size must be an integer")
-        if not 1 <= size <= MAX_KEYMAP_SIZE:
-            raise ValueError("Keyboard keymap size is outside the supported range")
-        if os.fstat(fd).st_size < size:
-            raise ValueError("Keyboard keymap file is shorter than its declared size")
-        with mmap.mmap(
-            fd,
-            size,
-            flags=mmap.MAP_PRIVATE,
-            prot=mmap.PROT_READ,
-        ) as mapping:
-            data = mapping[:]
-        if not data.endswith(b"\0"):
-            raise ValueError("XKB-v1 keymap must be null-terminated")
-        return data
-    finally:
-        os.close(fd)
-
-
-def create_keymap_fd(data: bytes) -> int:
-    """Return a caller-owned anonymous FD containing an XKB-v1 keymap copy."""
-    if not isinstance(data, bytes):
-        raise TypeError("Keyboard keymap must be bytes")
-    if not 1 <= len(data) <= MAX_KEYMAP_SIZE:
-        raise ValueError("Keyboard keymap size is outside the supported range")
-    if not data.endswith(b"\0"):
-        raise ValueError("XKB-v1 keymap must be null-terminated")
-
-    with tempfile.TemporaryFile() as keymap_file:
-        if keymap_file.write(data) != len(data):
-            raise OSError("Could not write keyboard keymap")
-        keymap_file.flush()
-        fd = os.dup(keymap_file.fileno())
-    os.lseek(fd, 0, os.SEEK_SET)
-    return fd
+__all__ = [
+    "KEYMAP_FORMAT_XKB_V1",
+    "KEY_MAX",
+    "KeyStroke",
+    "VirtualKeyboard",
+    "XkbKeymap",
+    "create_keymap_fd",
+    "modifier_chord",
+    "parse_key_spec",
+    "read_keymap_fd",
+    "validate_keycode",
+]

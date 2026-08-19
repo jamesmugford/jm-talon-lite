@@ -60,7 +60,9 @@ class HyprlandTests(unittest.TestCase):
         cls.hyprland = _load_hyprland_module()
 
     def test_detects_hyprland_session(self):
-        with patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance"}, clear=True):
+        with patch.dict(
+            os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance"}, clear=True
+        ):
             self.assertTrue(self.hyprland._is_hyprland())
 
         with patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "Hyprland"}, clear=True):
@@ -128,7 +130,7 @@ class HyprlandTests(unittest.TestCase):
             self.hyprland.Actions.hyprland_switch_to_workspace('name"; error("x")')
 
         evaluate.assert_called_once_with(
-            'hl.dispatch(hl.dsp.focus({ workspace = "name\\\"; error(\\\"x\\\")" }))'
+            'hl.dispatch(hl.dsp.focus({ workspace = "name\\"; error(\\"x\\")" }))'
         )
 
     def test_lua_string_escapes_control_characters(self):

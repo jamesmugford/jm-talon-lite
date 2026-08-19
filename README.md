@@ -123,6 +123,13 @@ Run the unit and lightweight runtime tests:
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
 ```
 
+If Ruff is installed, run the configured static checks with:
+
+```sh
+ruff check apps plugins tests
+ruff format --check apps plugins tests
+```
+
 Rebuild the pinned PyWayland bundle and generated protocol bindings with:
 
 ```sh

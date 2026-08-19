@@ -96,7 +96,7 @@ def _lua_string(value: str) -> str:
         "\r": r"\r",
         "\t": r"\t",
         "\v": r"\v",
-        '"': r'\"',
+        '"': r"\"",
         "\\": r"\\",
     }
     encoded = []
@@ -167,9 +167,7 @@ def _move_active_window(direction: str) -> None:
         "d": (0, 10),
     }
     if direction not in offsets:
-        _dispatch(
-            f"hl.dsp.window.move({{ direction = {_lua_string(direction)} }})"
-        )
+        _dispatch(f"hl.dsp.window.move({{ direction = {_lua_string(direction)} }})")
         return
 
     x, y = offsets[direction]
