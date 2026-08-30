@@ -6,11 +6,14 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from talon import Context, Module, actions, app, cron, registry, scope
+from talon import Context, Module, actions, app, cron, registry, scope, ui
+from talon.plugins import eye_mouse
 
 from .wayland_backend.desktop import WaylandDesktop
 from .wayland_backend.errors import CapabilityUnavailable
+from .wayland_backend.geometry import normalize_point
 from .wayland_backend.key_spec import KeyAction, KeyEvent, parse_key_spec
+from .wayland_backend.outputs import OutputTarget
 from .wayland_backend.session import is_wayland_session
 from .wayland_backend.windows import Window
 
@@ -31,6 +34,7 @@ _fallback_held_keys = set(
     )
 )
 _PROTOCOL_FEATURES = {
+    "wl_output": "output-bound gaze forwarding",
     "zwp_virtual_keyboard_manager_v1": "keyboard forwarding",
     "zwlr_virtual_pointer_manager_v1": "pointer, gaze, and hiss forwarding",
     "zwlr_foreign_toplevel_manager_v1": "application and window contexts",
@@ -238,6 +242,45 @@ class _TalonWaylandBridge:
             if self._modifier_tokens.get(token) is pressed:
                 self._modifier_tokens.pop(token)
 
+    def move_pointer_on_main_screen(
+        self,
+        x: float,
+        y: float,
+        *,
+        refresh_hover: bool = False,
+    ) -> None:
+        """Move within Talon's current eye-mouse screen through its wl_output."""
+        screen = eye_mouse.main_screen or ui.main_screen()
+        if screen is None:
+            raise CapabilityUnavailable("Talon main screen is not available")
+        rect = screen.rect
+        if rect.width <= 0 or rect.height <= 0:
+            raise CapabilityUnavailable("Talon main screen has invalid dimensions")
+        scale = float(getattr(screen, "scale", 1.0) or 1.0)
+        target = OutputTarget(
+            name=str(getattr(screen, "name", "") or ""),
+            make=str(getattr(screen, "manufacturer", "") or ""),
+            model=str(getattr(screen, "model", "") or ""),
+            physical_width=float(getattr(screen, "mm_x", 0.0) or 0.0),
+            physical_height=float(getattr(screen, "mm_y", 0.0) or 0.0),
+            mode_width=round(rect.width * scale),
+            mode_height=round(rect.height * scale),
+            refresh_millihz=round(
+                float(getattr(screen, "refresh_rate", 0.0) or 0.0) * 1000
+            ),
+        )
+        normalized_x, normalized_y = normalize_point(
+            (rect.x, rect.y, rect.width, rect.height),
+            x,
+            y,
+        )
+        self.desktop.move_pointer_output_absolute(
+            target,
+            normalized_x,
+            normalized_y,
+            refresh_hover=refresh_hover,
+        )
+
     def _initialize_scopes(self) -> None:
         """Capture Talon's scope declarations and their original providers."""
         self._app_scope_decl = scope.scopes["app"]
@@ -393,12 +436,18 @@ class _TalonWaylandBridge:
 
     def _warn_for_missing_protocols(self) -> None:
         """Print one warning listing unavailable feature protocols."""
-        available = {name for name, _version in self.desktop.status().protocols}
+        available = dict(self.desktop.status().protocols)
         missing = [
             f"{protocol} ({feature})"
             for protocol, feature in _PROTOCOL_FEATURES.items()
             if protocol not in available
         ]
+        pointer_version = available.get("zwlr_virtual_pointer_manager_v1")
+        if pointer_version is not None and pointer_version < 2:
+            missing.append(
+                "zwlr_virtual_pointer_manager_v1 version 2 "
+                "(output-bound gaze forwarding)"
+            )
         if missing:
             print(
                 "Wayland compositor compatibility warning: missing "
@@ -417,6 +466,16 @@ class Actions:
     ) -> None:
         """Move the pointer to normalized desktop coordinates."""
         _bridge.desktop.move_pointer_absolute(
+            x,
+            y,
+            refresh_hover=refresh_hover,
+        )
+
+    def wayland_pointer_move_main_screen(
+        x: float, y: float, refresh_hover: bool = False
+    ) -> None:
+        """Move the pointer within Talon's current eye-mouse screen."""
+        _bridge.move_pointer_on_main_screen(
             x,
             y,
             refresh_hover=refresh_hover,

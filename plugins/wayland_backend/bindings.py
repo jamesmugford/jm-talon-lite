@@ -26,7 +26,7 @@ def load_wayland_bindings() -> WaylandBindings:
     from pywayland.protocol.virtual_keyboard_unstable_v1 import (
         ZwpVirtualKeyboardManagerV1,
     )
-    from pywayland.protocol.wayland import WlSeat
+    from pywayland.protocol.wayland import WlOutput, WlSeat
     from pywayland.protocol.wlr_foreign_toplevel_management_unstable_v1 import (
         ZwlrForeignToplevelManagerV1,
     )
@@ -38,6 +38,7 @@ def load_wayland_bindings() -> WaylandBindings:
         raise RuntimeError("Bundled PyWayland is missing wl_display_cancel_read")
     interfaces = (
         WlSeat,
+        WlOutput,
         ZwpVirtualKeyboardManagerV1,
         ZwlrVirtualPointerManagerV1,
         ZwlrForeignToplevelManagerV1,

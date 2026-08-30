@@ -11,6 +11,7 @@ try:
     from wayland_backend.errors import CapabilityUnavailable
     from wayland_backend.key_spec import KeyEvent
     from wayland_backend.keyboard import VirtualKeyboard
+    from wayland_backend.outputs import OutputRegistry
     from wayland_backend.pointer import VirtualPointer
     from wayland_backend.seats import SeatRegistry
     from wayland_backend.windows import ForeignToplevels
@@ -22,6 +23,7 @@ class WaylandDesktopTests(unittest.TestCase):
     def test_composes_semantic_capabilities_without_constructor_io(self):
         desktop = WaylandDesktop()
         self.assertIsInstance(desktop._seats, SeatRegistry)
+        self.assertIsInstance(desktop._outputs, OutputRegistry)
         self.assertIsInstance(desktop._keyboard, VirtualKeyboard)
         self.assertIsInstance(desktop._pointer, VirtualPointer)
         self.assertIsInstance(desktop._windows, ForeignToplevels)
@@ -30,6 +32,7 @@ class WaylandDesktopTests(unittest.TestCase):
         self.assertFalse(status.keyboard_available)
         self.assertFalse(status.pointer_available)
         self.assertEqual(status.protocols, ())
+        self.assertEqual(status.outputs, ())
 
     def test_modified_click_preflights_then_orders_both_capabilities(self):
         desktop = WaylandDesktop()

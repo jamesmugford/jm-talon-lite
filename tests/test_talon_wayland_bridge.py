@@ -99,6 +99,18 @@ def load_bridge_module():
     talon.app = FakeApp()
     talon.cron = FakeCron()
     talon.registry = FakeRegistry()
+    rect = types.SimpleNamespace(x=100.0, y=200.0, width=3840.0, height=2160.0)
+    main_screen = types.SimpleNamespace(
+        name="HDMI-A-1",
+        manufacturer="Wacom Tech",
+        model="CintiqPro24PT",
+        mm_x=530.0,
+        mm_y=300.0,
+        refresh_rate=60.0,
+        scale=1.0,
+        rect=rect,
+    )
+    talon.ui = types.SimpleNamespace(main_screen=lambda: main_screen)
     talon.scope = types.SimpleNamespace(
         scopes={
             "app": FakeScopeDeclaration(lambda: {"original": "app"}),
@@ -108,10 +120,16 @@ def load_bridge_module():
     path = root / "plugins" / "wayland_runtime.py"
     spec = importlib.util.spec_from_file_location("plugins.wayland_runtime", path)
     module = importlib.util.module_from_spec(spec)
+    plugins_module = types.ModuleType("talon.plugins")
+    plugins_module.eye_mouse = types.SimpleNamespace(main_screen=main_screen)
+    talon.eye_mouse = plugins_module.eye_mouse
     old_bridge = getattr(sys, "_jm_talon_lite_wayland_bridge", None)
     if old_bridge is not None:
         delattr(sys, "_jm_talon_lite_wayland_bridge")
-    with patch.dict(sys.modules, {"talon": talon}):
+    with patch.dict(
+        sys.modules,
+        {"talon": talon, "talon.plugins": plugins_module},
+    ):
         spec.loader.exec_module(module)
     return module, talon
 
@@ -165,6 +183,7 @@ class TalonWaylandBridgeTests(unittest.TestCase):
     def test_start_delegates_and_warns_only_for_missing_protocols(self):
         bridge = self.module._TalonWaylandBridge()
         complete = (
+            ("wl_output", 4),
             ("zwp_virtual_keyboard_manager_v1", 1),
             ("zwlr_virtual_pointer_manager_v1", 2),
             ("zwlr_foreign_toplevel_manager_v1", 3),
@@ -192,6 +211,24 @@ class TalonWaylandBridgeTests(unittest.TestCase):
         start.assert_called_once_with()
         install.assert_called_once_with()
         output.assert_not_called()
+
+    def test_warns_when_virtual_pointer_cannot_bind_an_output(self):
+        bridge = self.module._TalonWaylandBridge()
+        status = types.SimpleNamespace(
+            protocols=(
+                ("wl_output", 4),
+                ("zwp_virtual_keyboard_manager_v1", 1),
+                ("zwlr_virtual_pointer_manager_v1", 1),
+                ("zwlr_foreign_toplevel_manager_v1", 3),
+            )
+        )
+        with (
+            patch.object(bridge.desktop, "status", return_value=status),
+            patch("builtins.print") as output,
+        ):
+            bridge._warn_for_missing_protocols()
+
+        self.assertIn("version 2", output.call_args.args[0])
 
     def test_start_recovers_an_autonomously_stopped_desktop(self):
         bridge = self.module._TalonWaylandBridge()
@@ -403,6 +440,35 @@ class TalonWaylandBridgeTests(unittest.TestCase):
             bridge.end_temporary_modifiers(token)
 
         release.assert_called_once_with(pressed)
+
+    def test_main_screen_motion_uses_screen_local_normalization(self):
+        bridge = self.module._TalonWaylandBridge()
+        with patch.object(bridge.desktop, "move_pointer_output_absolute") as move:
+            bridge.move_pointer_on_main_screen(
+                2020.0,
+                1280.0,
+                refresh_hover=True,
+            )
+
+        target, x, y = move.call_args.args
+        self.assertEqual(target.name, "HDMI-A-1")
+        self.assertEqual(target.mode_width, 3840)
+        self.assertEqual(target.mode_height, 2160)
+        self.assertEqual((x, y), (0.5, 0.5))
+        self.assertEqual(move.call_args.kwargs, {"refresh_hover": True})
+
+    def test_main_screen_motion_falls_back_to_ui_screen(self):
+        bridge = self.module._TalonWaylandBridge()
+        original = self.talon.eye_mouse.main_screen
+        self.talon.eye_mouse.main_screen = None
+        try:
+            with patch.object(bridge.desktop, "move_pointer_output_absolute") as move:
+                bridge.move_pointer_on_main_screen(100.0, 200.0)
+        finally:
+            self.talon.eye_mouse.main_screen = original
+
+        _target, x, y = move.call_args.args
+        self.assertEqual((x, y), (0.0, 0.0))
 
     def test_wayland_detection_uses_standard_session_environment(self):
         with patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland"}, clear=True):

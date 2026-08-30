@@ -31,7 +31,8 @@ know.
 
 - Layout-aware native keyboard input
 - Eye tracking through Control Mouse (Legacy), including the custom Hiss Mouse
-  mode
+  mode. Gaze is mapped to Talon's main eye-mouse output, so additional monitors
+  and compositor scaling do not change its position multipliers.
 - Mouse button and scrolling commands such as `touch`, `righty`, `drag`, and
   `wheel up`
 - Active Wayland application and window-title contexts
@@ -55,6 +56,7 @@ Linux X11, macOS, or Windows are unavailable under Wayland.
 
 ## Wayland protocols
 
+- `wl_output` - output discovery and main eye-mouse display matching
 - `zwp_virtual_keyboard_manager_v1` - keyboard input
 - `zwlr_virtual_pointer_manager_v1` - pointer, clicks, scrolling, gaze, hiss, and pop input
 - `zwlr_foreign_toplevel_manager_v1` - application and window-title contexts

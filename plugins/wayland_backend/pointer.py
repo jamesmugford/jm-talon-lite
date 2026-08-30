@@ -9,6 +9,7 @@ from typing import Any
 
 from .connection import WaylandConnection, monotonic_timestamp_ms, run_cleanup_steps
 from .errors import CapabilityUnavailable
+from .outputs import OutputRegistry, OutputTarget
 from .seats import SeatRegistry
 
 POINTER_EXTENT = 65535
@@ -84,7 +85,7 @@ def linux_button_code(button: int) -> int:
 
 
 class VirtualPointer:
-    """Own zwlr_virtual_pointer_manager_v1 and its selected-seat pointer."""
+    """Own desktop-wide and output-bound pointers for the selected seat."""
 
     interface_name = "zwlr_virtual_pointer_manager_v1"
     multiple = False
@@ -93,19 +94,26 @@ class VirtualPointer:
         self,
         connection: WaylandConnection,
         seats: SeatRegistry,
+        outputs: OutputRegistry,
         timestamp_ms: Callable[[], int] = monotonic_timestamp_ms,
     ) -> None:
         """Create an unavailable pointer without performing protocol I/O."""
         self._connection = connection
         self._seats = seats
+        self._outputs = outputs
         self._timestamp_ms = timestamp_ms
         self._lock = threading.Lock()
         self._manager_name: int | None = None
+        self._manager_version = 0
         self._manager: Any = None
         self._pointer: Any = None
+        self._output_pointer: Any = None
+        self._output_id: int | None = None
+        self._output_target: OutputTarget | None = None
         self._seat_id: int | None = None
         self._held_buttons: set[int] = set()
         self._unsubscribe_seats = seats.subscribe(self._on_seat_changed)
+        self._unsubscribe_outputs = outputs.subscribe(self._on_outputs_changed)
 
     def bind(self, registry: Any, name: int, version: int, interface: type) -> int:
         """Bind the pointer manager and create a pointer when a seat exists."""
@@ -113,6 +121,7 @@ class VirtualPointer:
         manager = registry.bind(name, interface, negotiated)
         with self._lock:
             self._manager_name = name
+            self._manager_version = negotiated
             self._manager = manager
         self._maybe_create()
         return negotiated
@@ -124,9 +133,11 @@ class VirtualPointer:
                 return
             manager = self._manager
             self._manager_name = None
+            self._manager_version = 0
             self._manager = None
         run_cleanup_steps(
             (
+                ("output-bound virtual pointer", self._destroy_output_pointer),
                 ("virtual pointer", self._destroy_pointer),
                 ("virtual pointer manager", lambda: self._destroy_manager(manager)),
             )
@@ -141,9 +152,11 @@ class VirtualPointer:
         with self._lock:
             manager = self._manager
             self._manager_name = None
+            self._manager_version = 0
             self._manager = None
         run_cleanup_steps(
             (
+                ("output-bound virtual pointer", self._destroy_output_pointer),
                 ("virtual pointer", self._destroy_pointer),
                 ("virtual pointer manager", lambda: self._destroy_manager(manager)),
             )
@@ -168,6 +181,29 @@ class VirtualPointer:
         x_value, y_value = normalized_to_extent(x, y)
         self._connection.execute(
             lambda: self._emit_absolute(x_value, y_value, refresh_hover),
+            timeout,
+        )
+
+    def move_output_absolute(
+        self,
+        target: OutputTarget,
+        x: float,
+        y: float,
+        *,
+        refresh_hover: bool = False,
+        timeout: float = 1.0,
+    ) -> None:
+        """Move to normalized coordinates within one matched output."""
+        if type(refresh_hover) is not bool:
+            raise TypeError("Pointer hover refresh must be a boolean")
+        x_value, y_value = normalized_to_extent(x, y)
+        self._connection.execute(
+            lambda: self._emit_output_absolute(
+                target,
+                x_value,
+                y_value,
+                refresh_hover,
+            ),
             timeout,
         )
 
@@ -227,8 +263,24 @@ class VirtualPointer:
         with self._lock:
             old_seat_id = self._seat_id
         if old_seat_id != seat_id:
-            self._destroy_pointer()
+            run_cleanup_steps(
+                (
+                    ("output-bound virtual pointer", self._destroy_output_pointer),
+                    ("virtual pointer", self._destroy_pointer),
+                )
+            )
         self._maybe_create()
+
+    def _on_outputs_changed(self) -> None:
+        """Drop a bound pointer when its target resolves to another output."""
+        with self._lock:
+            target = self._output_target
+            output_id = self._output_id
+        if target is None:
+            return
+        selected = self._outputs.match(target)
+        if selected is None or selected.id != output_id:
+            self._destroy_output_pointer()
 
     def _maybe_create(self) -> None:
         """Create a virtual pointer when manager, seat, and startup are ready."""
@@ -289,6 +341,16 @@ class VirtualPointer:
         finally:
             self._held_buttons.clear()
 
+    def _destroy_output_pointer(self) -> None:
+        """Destroy the output-bound motion pointer idempotently."""
+        with self._lock:
+            pointer = self._output_pointer
+            self._output_pointer = None
+            self._output_id = None
+            self._output_target = None
+        if pointer is not None and not pointer.destroyed:
+            pointer.destroy()
+
     @staticmethod
     def _destroy_manager(manager: Any) -> None:
         """Destroy one virtual-pointer manager when it remains live."""
@@ -303,27 +365,90 @@ class VirtualPointer:
             raise CapabilityUnavailable("Wayland virtual pointer is not available")
         return pointer
 
+    def _require_output_pointer(self, target: OutputTarget) -> Any:
+        """Return a pointer bound to the output matching the supplied target."""
+        selected = self._outputs.match(target)
+        if selected is None:
+            raise CapabilityUnavailable(
+                f"No unique Wayland output matches Talon screen {target.name!r}"
+            )
+        seat = self._seats.selected()
+        with self._lock:
+            manager = self._manager
+            manager_version = self._manager_version
+            pointer = self._output_pointer
+            output_id = self._output_id
+        if manager is None or manager_version < 2 or seat is None:
+            raise CapabilityUnavailable(
+                "Output-bound Wayland virtual pointer is not available"
+            )
+        if pointer is not None and not pointer.destroyed and output_id == selected.id:
+            with self._lock:
+                self._output_target = target
+            return pointer
+        self._destroy_output_pointer()
+        pointer = manager.create_virtual_pointer_with_output(
+            seat.proxy,
+            selected.proxy,
+        )
+        with self._lock:
+            self._output_pointer = pointer
+            self._output_id = selected.id
+            self._output_target = target
+        return pointer
+
     def _emit_absolute(self, x: int, y: int, refresh_hover: bool) -> None:
         """Emit one absolute motion transaction on the owner thread."""
         pointer = self._require_pointer()
         try:
-            pointer.motion_absolute(
-                self._timestamp_ms(),
-                x,
-                y,
-                POINTER_EXTENT,
-                POINTER_EXTENT,
-            )
-            pointer.frame()
-            if refresh_hover:
-                nudge = -1.0 if x == POINTER_EXTENT else 1.0
-                pointer.motion(self._timestamp_ms(), nudge, 0.0)
-                pointer.frame()
-                pointer.motion(self._timestamp_ms(), -nudge, 0.0)
-                pointer.frame()
+            self._emit_absolute_events(pointer, x, y, refresh_hover)
         except Exception as exc:
             self._connection.fail(exc)
             raise
+
+    def _emit_output_absolute(
+        self,
+        target: OutputTarget,
+        x: int,
+        y: int,
+        refresh_hover: bool,
+    ) -> None:
+        """Emit absolute motion in one matched output's coordinate frame."""
+        try:
+            pointer = self._require_output_pointer(target)
+        except CapabilityUnavailable:
+            raise
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise
+        try:
+            self._emit_absolute_events(pointer, x, y, refresh_hover)
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise
+
+    def _emit_absolute_events(
+        self,
+        pointer: Any,
+        x: int,
+        y: int,
+        refresh_hover: bool,
+    ) -> None:
+        """Send one absolute motion transaction through a supplied pointer."""
+        pointer.motion_absolute(
+            self._timestamp_ms(),
+            x,
+            y,
+            POINTER_EXTENT,
+            POINTER_EXTENT,
+        )
+        pointer.frame()
+        if refresh_hover:
+            nudge = -1.0 if x == POINTER_EXTENT else 1.0
+            pointer.motion(self._timestamp_ms(), nudge, 0.0)
+            pointer.frame()
+            pointer.motion(self._timestamp_ms(), -nudge, 0.0)
+            pointer.frame()
 
     def _emit_relative(self, dx: float, dy: float) -> None:
         """Emit one relative motion transaction on the owner thread."""

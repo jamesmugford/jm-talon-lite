@@ -10,6 +10,7 @@ from .connection import WaylandConnection, monotonic_timestamp_ms
 from .errors import CapabilityUnavailable
 from .key_spec import KeyEvent, modifier_chord
 from .keyboard import VirtualKeyboard
+from .outputs import OutputRegistry, OutputSnapshot, OutputTarget
 from .pointer import VirtualPointer, linux_button_code
 from .seats import SeatRegistry, SeatSnapshot
 from .windows import ForeignToplevels, Window
@@ -22,6 +23,7 @@ class DesktopStatus:
     running: bool
     protocols: tuple[tuple[str, int], ...]
     seats: tuple[SeatSnapshot, ...]
+    outputs: tuple[OutputSnapshot, ...]
     windows: tuple[Window, ...]
     active_window: Window | None
     keyboard_available: bool
@@ -41,6 +43,7 @@ class WaylandDesktop:
         """Construct every capability without connecting to Wayland."""
         self._connection = WaylandConnection(load_bindings)
         self._seats = SeatRegistry(self._connection)
+        self._outputs = OutputRegistry(self._connection)
         self._keyboard = VirtualKeyboard(
             self._connection,
             self._seats,
@@ -49,10 +52,12 @@ class WaylandDesktop:
         self._pointer = VirtualPointer(
             self._connection,
             self._seats,
+            self._outputs,
             timestamp_ms,
         )
         self._windows = ForeignToplevels(self._connection)
         self._connection.register(self._seats)
+        self._connection.register(self._outputs)
         self._connection.register(self._keyboard)
         self._connection.register(self._pointer)
         self._connection.register(self._windows)
@@ -71,6 +76,7 @@ class WaylandDesktop:
             running=self._connection.running(),
             protocols=self._connection.protocols(),
             seats=self._seats.snapshots(),
+            outputs=self._outputs.snapshots(),
             windows=self._windows.snapshots(),
             active_window=self._windows.active(),
             keyboard_available=self._keyboard.available(),
@@ -144,6 +150,24 @@ class WaylandDesktop:
     ) -> None:
         """Move the native pointer to normalized desktop coordinates."""
         self._pointer.move_absolute(
+            x,
+            y,
+            refresh_hover=refresh_hover,
+            timeout=timeout,
+        )
+
+    def move_pointer_output_absolute(
+        self,
+        target: OutputTarget,
+        x: float,
+        y: float,
+        *,
+        refresh_hover: bool = False,
+        timeout: float = 1.0,
+    ) -> None:
+        """Move the native pointer to normalized coordinates on one output."""
+        self._pointer.move_output_absolute(
+            target,
             x,
             y,
             refresh_hover=refresh_hover,

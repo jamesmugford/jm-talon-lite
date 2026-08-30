@@ -48,6 +48,7 @@ def make_talon(*, settings=None):
         user=types.SimpleNamespace(
             mouse_forwarder_native_pointer_selected=lambda: True,
             wayland_pointer_move_absolute=lambda *_args, **_kwargs: None,
+            wayland_pointer_move_main_screen=lambda *_args, **_kwargs: None,
         ),
     )
     talon.app = FakeApp()
@@ -55,7 +56,11 @@ def make_talon(*, settings=None):
     talon.tracking_system = FakeTrackingSystem()
     talon.ui = types.SimpleNamespace(
         register=lambda _event, _callback: None,
+        unregistered=[],
         screens=lambda: (),
+    )
+    talon.ui.unregister = (
+        lambda event, callback: talon.ui.unregistered.append((event, callback))
     )
     plugins_module = types.ModuleType("talon.plugins")
     plugins_module.eye_mouse = types.SimpleNamespace(
@@ -86,6 +91,75 @@ def load_tracking_module(filename, *, talon, plugins_module, legacy_globals=None
 
 
 class TrackingReloadTests(unittest.TestCase):
+    def test_pointer_forwarder_unregisters_legacy_screen_callback(self):
+        talon, plugins_module = make_talon()
+
+        def legacy_screen_callback(_screens):
+            pass
+
+        load_tracking_module(
+            "control1_pointer_forwarder.py",
+            talon=talon,
+            plugins_module=plugins_module,
+            legacy_globals={"_on_screen_change": legacy_screen_callback},
+        )
+
+        self.assertEqual(
+            talon.ui.unregistered,
+            [("screen_change", legacy_screen_callback)],
+        )
+
+    def test_pointer_forwarder_sends_raw_control_mouse_point_to_main_screen(self):
+        callback_key = "_jm_talon_lite_control1_pointer_callback"
+        state_key = "_jm_talon_lite_control1_pointer_enabled"
+        saved_callback = getattr(sys, callback_key, None)
+        saved_state = getattr(sys, state_key, None)
+        for retained_key in (callback_key, state_key):
+            if hasattr(sys, retained_key):
+                delattr(sys, retained_key)
+        talon, plugins_module = make_talon()
+        talon.actions.tracking.control1_enabled = lambda: True
+        plugins_module.eye_mouse.mouse.xy_hist = [
+            types.SimpleNamespace(x=1920.0, y=1080.0)
+        ]
+        calls = []
+        talon.actions.user.wayland_pointer_move_main_screen = (
+            lambda *args, **kwargs: calls.append((args, kwargs))
+        )
+        loaded = None
+        try:
+            loaded = load_tracking_module(
+                "control1_pointer_forwarder.py",
+                talon=talon,
+                plugins_module=plugins_module,
+            )
+            loaded._on_gaze()
+            self.assertEqual(
+                calls,
+                [((1920.0, 1080.0), {"refresh_hover": True})],
+            )
+            fallback_calls = []
+            talon.actions.mouse_move = (
+                lambda x, y: fallback_calls.append((x, y))
+            )
+
+            def unavailable(*_args, **_kwargs):
+                raise loaded.CapabilityUnavailable("output unavailable")
+
+            talon.actions.user.wayland_pointer_move_main_screen = unavailable
+            loaded._on_gaze()
+            self.assertEqual(fallback_calls, [(1920.0, 1080.0)])
+        finally:
+            if loaded is not None:
+                loaded._unregister_gaze()
+            for retained_key in (callback_key, state_key):
+                if hasattr(sys, retained_key):
+                    delattr(sys, retained_key)
+            if saved_callback is not None:
+                setattr(sys, callback_key, saved_callback)
+            if saved_state is not None:
+                setattr(sys, state_key, saved_state)
+
     def test_gaze_logger_removes_legacy_global_callback(self):
         key = "_jm_talon_lite_control1_gaze_logger_callback"
         state_key = "_jm_talon_lite_control1_gaze_logger_enabled"

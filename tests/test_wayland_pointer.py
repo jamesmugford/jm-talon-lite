@@ -2,6 +2,7 @@ import math
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 if __package__:
@@ -12,6 +13,7 @@ else:
 PLUGINS = Path(__file__).resolve().parents[1] / "plugins"
 sys.path.insert(0, str(PLUGINS))
 try:
+    from wayland_backend.errors import CapabilityUnavailable
     from wayland_backend.pointer import (
         INT32_MAX,
         POINTER_EXTENT,
@@ -22,6 +24,7 @@ try:
         validate_int32,
         validate_wayland_fixed,
     )
+    from wayland_backend.outputs import OutputRegistry, OutputTarget
     from wayland_backend.seats import SeatRegistry
 finally:
     sys.path.remove(str(PLUGINS))
@@ -64,9 +67,11 @@ class VirtualPointerTests(unittest.TestCase):
     def setUp(self):
         self.connection = ImmediateConnection()
         self.seats = SeatRegistry(self.connection)
+        self.outputs = OutputRegistry(self.connection)
         self.pointer_adapter = VirtualPointer(
             self.connection,
             self.seats,
+            self.outputs,
             timestamp_ms=lambda: 1234,
         )
         self.registry = FakeRegistry()
@@ -75,6 +80,32 @@ class VirtualPointerTests(unittest.TestCase):
         self.manager = self.registry.bound[1][3]
         self.pointer = self.manager.created_pointers[0]
         self.pointer.calls.clear()
+
+    def _bind_output(self, output_id=30, name="HDMI-A-1"):
+        self.outputs.bind(self.registry, output_id, 4, interface(4))
+        output = self.registry.bound[-1][3]
+        output.dispatcher["geometry"](
+            output, 0, 0, 530, 300, 0, "Wacom Tech", "CintiqPro24PT", 0
+        )
+        output.dispatcher["mode"](output, 1, 3840, 2160, 60000)
+        output.dispatcher["scale"](output, 2)
+        output.dispatcher["name"](output, name)
+        output.dispatcher["description"](output, "Wacom Tech CintiqPro24PT")
+        output.dispatcher["done"](output)
+        return output
+
+    @staticmethod
+    def _target(name="HDMI-A-1"):
+        return OutputTarget(
+            name,
+            "Wacom Tech",
+            "CintiqPro24PT",
+            530,
+            300,
+            3840,
+            2160,
+            60000,
+        )
 
     def test_emits_expected_motion_button_and_scroll_order(self):
         self.pointer_adapter.move_absolute(-1.0, 2.0, refresh_hover=True)
@@ -111,6 +142,109 @@ class VirtualPointerTests(unittest.TestCase):
             ],
         )
 
+    def test_output_bound_motion_uses_selected_output_without_desktop_scaling(self):
+        output = self._bind_output()
+
+        self.pointer_adapter.move_output_absolute(
+            self._target(),
+            0.5,
+            0.5,
+            refresh_hover=True,
+        )
+
+        output_pointer = self.manager.created_pointers[-1]
+        self.assertEqual(
+            self.manager.calls[-1],
+            (
+                "create_virtual_pointer_with_output",
+                self.registry.bound[0][3],
+                output,
+            ),
+        )
+        self.assertEqual(
+            output_pointer.calls,
+            [
+                ("motion_absolute", 1234, 32768, 32768, 65535, 65535),
+                ("frame",),
+                ("motion", 1234, 1.0, 0.0),
+                ("frame",),
+                ("motion", 1234, -1.0, 0.0),
+                ("frame",),
+            ],
+        )
+        self.assertEqual(self.pointer.calls, [])
+
+    def test_output_target_from_an_older_reload_generation_is_accepted(self):
+        self._bind_output()
+        reloaded_target = SimpleNamespace(
+            name="HDMI-A-1",
+            make="Wacom Tech",
+            model="CintiqPro24PT",
+            physical_width=530,
+            physical_height=300,
+            mode_width=3840,
+            mode_height=2160,
+            refresh_millihz=60000,
+        )
+
+        self.pointer_adapter.move_output_absolute(reloaded_target, 0.5, 0.5)
+
+        output_pointer = self.manager.created_pointers[-1]
+        self.assertEqual(
+            output_pointer.calls[:2],
+            [
+                ("motion_absolute", 1234, 32768, 32768, 65535, 65535),
+                ("frame",),
+            ],
+        )
+
+    def test_output_removal_destroys_bound_pointer_before_output_release(self):
+        output = self._bind_output()
+        self.pointer_adapter.move_output_absolute(self._target(), 0.5, 0.5)
+        output_pointer = self.manager.created_pointers[-1]
+        self.registry.event_log.clear()
+
+        self.outputs.remove(30)
+
+        self.assertTrue(output_pointer.destroyed)
+        self.assertLess(
+            self.registry.event_log.index((output_pointer, "destroy")),
+            self.registry.event_log.index((output, "release")),
+        )
+
+    def test_manager_v1_reports_output_bound_motion_unavailable(self):
+        connection = ImmediateConnection()
+        seats = SeatRegistry(connection)
+        outputs = OutputRegistry(connection)
+        pointer_adapter = VirtualPointer(connection, seats, outputs)
+        registry = FakeRegistry()
+        seats.bind(registry, 20, 11, interface(11))
+        pointer_adapter.bind(registry, 10, 1, interface(2))
+        outputs.bind(registry, 30, 4, interface(4))
+        output = registry.bound[-1][3]
+        output.dispatcher["name"](output, "HDMI-A-1")
+        output.dispatcher["done"](output)
+
+        with self.assertRaisesRegex(CapabilityUnavailable, "not available"):
+            pointer_adapter.move_output_absolute(self._target(), 0.5, 0.5)
+
+    def test_output_pointer_creation_failure_stops_connection(self):
+        self._bind_output()
+        with patch.object(
+            self.manager,
+            "create_virtual_pointer_with_output",
+            side_effect=RuntimeError("create failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "create failed"):
+                self.pointer_adapter.move_output_absolute(
+                    self._target(),
+                    0.5,
+                    0.5,
+                )
+
+        self.assertTrue(self.connection.stopping)
+        self.assertEqual(str(self.connection.failures[0]), "create failed")
+
     def test_toggle_release_and_teardown_are_state_safe(self):
         self.assertTrue(self.pointer_adapter.toggle_button(2))
         self.assertFalse(self.pointer_adapter.toggle_button(2))
@@ -130,17 +264,28 @@ class VirtualPointerTests(unittest.TestCase):
     def test_seat_replacement_recreates_pointer_before_old_seat_release(self):
         first_pointer = self.pointer
         first_seat = self.registry.bound[0][3]
+        self._bind_output()
+        self.pointer_adapter.move_output_absolute(self._target(), 0.5, 0.5)
+        first_output_pointer = self.manager.created_pointers[-1]
         self.registry.event_log.clear()
         self.seats.bind(self.registry, 21, 11, interface(11))
-        second_seat = self.registry.bound[2][3]
+        second_seat = self.registry.bound[3][3]
         second_seat.dispatcher["name"](second_seat, "seat0")
 
         self.assertTrue(first_pointer.destroyed)
+        self.assertTrue(first_output_pointer.destroyed)
         self.assertLess(
             self.registry.event_log.index((first_pointer, "destroy")),
             self.registry.event_log.index((self.manager, "create_virtual_pointer")),
         )
         self.assertFalse(first_seat.destroyed)
+
+        self.pointer_adapter.move_output_absolute(self._target(), 0.5, 0.5)
+        self.assertEqual(
+            self.manager.calls[-1][0],
+            "create_virtual_pointer_with_output",
+        )
+        self.assertIs(self.manager.calls[-1][1], second_seat)
 
     def test_protocol_failure_stops_connection_and_preserves_uncertain_state(self):
         with patch.object(

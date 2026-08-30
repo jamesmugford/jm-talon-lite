@@ -89,6 +89,13 @@ class FakeProxy:
         self.created_pointers.append(pointer)
         return pointer
 
+    def create_virtual_pointer_with_output(self, seat, output) -> "FakeProxy":
+        """Create and record an output-bound virtual-pointer child."""
+        pointer = FakeProxy(self.event_log)
+        self._record(("create_virtual_pointer_with_output", seat, output))
+        self.created_pointers.append(pointer)
+        return pointer
+
     def get_keyboard(self) -> "FakeProxy":
         """Create and record a source wl_keyboard child."""
         keyboard = FakeProxy(self.event_log)

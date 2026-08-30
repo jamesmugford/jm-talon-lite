@@ -29,6 +29,12 @@ _previous_callbacks = {
 for _previous_callback in _previous_callbacks - {None}:
     for _ in range(16):
         tracking_system.unregister("gaze", _previous_callback)
+_legacy_screen_callback = globals().get("_on_screen_change")
+if _legacy_screen_callback is not None:
+    try:
+        ui.unregister("screen_change", _legacy_screen_callback)
+    except (KeyError, ValueError):
+        pass
 _resume_callback = _retained_callback or _legacy_callback
 if _resume_registered and _resume_callback is not None:
     setattr(sys, _CALLBACK_KEY, _resume_callback)
@@ -40,7 +46,6 @@ if _had_retained_state:
 from talon.plugins import eye_mouse  # noqa: E402
 
 from ..wayland_backend.errors import CapabilityUnavailable  # noqa: E402
-from ..wayland_backend.geometry import desktop_bounds, normalize_point  # noqa: E402
 from ..wayland_backend.session import is_wayland_session  # noqa: E402
 
 mod = Module()
@@ -51,7 +56,6 @@ mod.setting(
     desc="Auto-start native control1 pointer forwarding at Talon startup.",
 )
 
-_desktop_bounds = (0.0, 0.0, 1.0, 1.0)
 _registered = False
 
 
@@ -68,16 +72,6 @@ def _native_pointer_available() -> bool:
         return actions.user.mouse_forwarder_native_pointer_selected()
     except Exception:
         return False
-
-
-def _refresh_desktop_bounds() -> None:
-    """Cache the bounding rectangle covering every Talon screen."""
-    global _desktop_bounds
-    rects = [
-        (screen.rect.x, screen.rect.y, screen.rect.width, screen.rect.height)
-        for screen in ui.screens()
-    ]
-    _desktop_bounds = desktop_bounds(rects)
 
 
 def _clear_gaze_subscriptions(callback) -> None:
@@ -117,31 +111,20 @@ def _on_gaze(*_args) -> None:
     if not _native_pointer_available():
         actions.mouse_move(point.x, point.y)
         return
-    normalized_x, normalized_y = normalize_point(
-        _desktop_bounds,
-        point.x,
-        point.y,
-    )
     try:
-        actions.user.wayland_pointer_move_absolute(
-            normalized_x,
-            normalized_y,
+        actions.user.wayland_pointer_move_main_screen(
+            point.x,
+            point.y,
             refresh_hover=True,
         )
     except CapabilityUnavailable:
         actions.mouse_move(point.x, point.y)
 
 
-def _on_screen_change(_screens) -> None:
-    """Refresh pointer normalization after Talon's screen layout changes."""
-    _refresh_desktop_bounds()
-
-
 @mod.action_class
 class Actions:
     def control1_pointer_forwarder_start() -> None:
         """Start control1 forwarding through the native Wayland pointer."""
-        _refresh_desktop_bounds()
         _register_gaze()
 
     def control1_pointer_forwarder_stop() -> None:
@@ -158,9 +141,7 @@ class Actions:
 
 
 def _on_ready() -> None:
-    """Initialize geometry and honor the forwarding autostart setting."""
-    ui.register("screen_change", _on_screen_change)
-    _refresh_desktop_bounds()
+    """Honor the forwarding autostart setting after Talon is ready."""
     if not _had_retained_state and settings.get(
         "user.control1_pointer_forwarder_autostart"
     ):
@@ -174,7 +155,6 @@ def _on_quit() -> None:
 
 setattr(sys, _STATE_KEY, _resume_registered)
 if _resume_registered:
-    _refresh_desktop_bounds()
     _register_gaze()
 
 app.register("ready", _on_ready)
