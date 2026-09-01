@@ -132,6 +132,11 @@ def _scaled_scroll_delta(delta: float, setting_name: str) -> float:
     return delta / unit
 
 
+def _is_fractional(delta: float) -> bool:
+    """Return whether a Talon float contains a fractional component."""
+    return isinstance(delta, float) and not delta.is_integer()
+
+
 def _forward_scroll(
     vertical_delta: float = 0.0,
     horizontal_delta: float = 0.0,
@@ -142,6 +147,15 @@ def _forward_scroll(
     global _horizontal_scroll_remainder, _vertical_scroll_remainder
 
     with _scroll_lock:
+        if by_lines and (
+            _is_fractional(vertical_delta) or _is_fractional(horizontal_delta)
+        ):
+            actions.user.wayland_pointer_scroll_continuous(
+                vertical_lines=vertical_delta,
+                horizontal_lines=horizontal_delta,
+            )
+            return
+
         next_vertical_remainder = _vertical_scroll_remainder
         next_horizontal_remainder = _horizontal_scroll_remainder
         vertical_steps = 0

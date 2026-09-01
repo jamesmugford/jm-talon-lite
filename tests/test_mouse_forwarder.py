@@ -46,6 +46,9 @@ class FakeActions:
         self.scroll_emissions = []
         self.fail_scroll_call = None
         self.scroll_failure = None
+        self.continuous_scroll_attempts = []
+        self.continuous_scroll_emissions = []
+        self.continuous_scroll_failure = None
         self.key_calls = []
         self.click_calls = []
         self.modifier_starts = []
@@ -61,6 +64,7 @@ class FakeActions:
             wayland_pointer_button_down=self.native_button_down.append,
             wayland_pointer_button_up=self.native_button_up.append,
             wayland_pointer_scroll=self._scroll,
+            wayland_pointer_scroll_continuous=self._scroll_continuous,
         )
 
     def next(self, *args):
@@ -82,6 +86,13 @@ class FakeActions:
         if len(self.scroll_attempts) == self.fail_scroll_call:
             raise self.scroll_failure
         self.scroll_emissions.append(scroll)
+
+    def _scroll_continuous(self, vertical_lines=0.0, horizontal_lines=0.0):
+        scroll = (vertical_lines, horizontal_lines)
+        self.continuous_scroll_attempts.append(scroll)
+        if self.continuous_scroll_failure is not None:
+            raise self.continuous_scroll_failure
+        self.continuous_scroll_emissions.append(scroll)
 
 
 def load_mouse_forwarder_module():
@@ -127,6 +138,9 @@ class MouseForwarderTests(unittest.TestCase):
         self.talon.actions.scroll_emissions.clear()
         self.talon.actions.fail_scroll_call = None
         self.talon.actions.scroll_failure = None
+        self.talon.actions.continuous_scroll_attempts.clear()
+        self.talon.actions.continuous_scroll_emissions.clear()
+        self.talon.actions.continuous_scroll_failure = None
         self.talon.actions.key_calls.clear()
         self.talon.actions.click_calls.clear()
         self.talon.actions.modifier_starts.clear()
@@ -194,6 +208,48 @@ class MouseForwarderTests(unittest.TestCase):
         self.module.MainActions.mouse_scroll(1.0, -2.0, by_lines=True)
 
         self.assertEqual(self.talon.actions.scroll_emissions, [(1, -2)])
+        self.assertEqual(self.module._vertical_scroll_remainder, 0.0)
+        self.assertEqual(self.module._horizontal_scroll_remainder, 0.0)
+
+    def test_fractional_line_scroll_bypasses_accumulation(self):
+        self.module._vertical_scroll_remainder = 0.4
+        self.module._horizontal_scroll_remainder = 0.3
+
+        self.module.MainActions.mouse_scroll(0.25, -1.0, by_lines=True)
+
+        self.assertEqual(
+            self.talon.actions.continuous_scroll_emissions,
+            [(0.25, -1.0)],
+        )
+        self.assertEqual(self.talon.actions.scroll_attempts, [])
+        self.assertAlmostEqual(self.module._vertical_scroll_remainder, 0.4)
+        self.assertAlmostEqual(self.module._horizontal_scroll_remainder, 0.3)
+        self.assertEqual(self.talon.actions.next_calls, [])
+
+    def test_unavailable_fractional_line_scroll_falls_back_unchanged(self):
+        self.module._vertical_scroll_remainder = 0.4
+        self.module._horizontal_scroll_remainder = 0.3
+        self.talon.actions.continuous_scroll_failure = (
+            self.module.CapabilityUnavailable("lost")
+        )
+
+        self.module.MainActions.mouse_scroll(0.25, -0.5, by_lines=True)
+
+        self.assertEqual(
+            self.talon.actions.continuous_scroll_attempts,
+            [(0.25, -0.5)],
+        )
+        self.assertEqual(self.talon.actions.next_calls, [(0.25, -0.5, True)])
+        self.assertAlmostEqual(self.module._vertical_scroll_remainder, 0.4)
+        self.assertAlmostEqual(self.module._horizontal_scroll_remainder, 0.3)
+
+    def test_failed_fractional_line_scroll_is_not_replayed(self):
+        self.talon.actions.continuous_scroll_failure = RuntimeError("failed")
+
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            self.module.MainActions.mouse_scroll(0.25, by_lines=True)
+
+        self.assertEqual(self.talon.actions.next_calls, [])
         self.assertEqual(self.module._vertical_scroll_remainder, 0.0)
         self.assertEqual(self.module._horizontal_scroll_remainder, 0.0)
 

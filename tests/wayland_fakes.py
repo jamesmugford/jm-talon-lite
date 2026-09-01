@@ -145,6 +145,10 @@ class FakeProxy:
         """Record one pointer axis-source request."""
         self._record(("axis_source", source))
 
+    def axis(self, timestamp: int, axis: int, value: float) -> None:
+        """Record one continuous pointer axis request."""
+        self._record(("axis", timestamp, axis, value))
+
     def axis_discrete(
         self,
         timestamp: int,

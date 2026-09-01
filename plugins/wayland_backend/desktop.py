@@ -212,6 +212,20 @@ class WaylandDesktop:
         """Scroll discrete steps through the native pointer."""
         self._pointer.scroll(vertical, horizontal, timeout=timeout)
 
+    def scroll_pointer_continuous(
+        self,
+        vertical_lines: float = 0.0,
+        horizontal_lines: float = 0.0,
+        *,
+        timeout: float = 1.0,
+    ) -> None:
+        """Scroll fractional lines continuously through the native pointer."""
+        self._pointer.scroll_continuous(
+            vertical_lines,
+            horizontal_lines,
+            timeout=timeout,
+        )
+
     def modified_click(
         self,
         modifiers: str,

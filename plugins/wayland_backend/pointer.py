@@ -25,6 +25,7 @@ BUTTON_CODES = {
 _AXIS_VERTICAL = 0
 _AXIS_HORIZONTAL = 1
 _AXIS_SOURCE_WHEEL = 0
+_AXIS_SOURCE_CONTINUOUS = 2
 _BUTTON_RELEASED = 0
 _BUTTON_PRESSED = 1
 _SCROLL_DISTANCE_PER_STEP = 15.0
@@ -254,6 +255,38 @@ class VirtualPointer:
         )
         self._connection.execute(
             lambda: self._emit_scroll(vertical, horizontal), timeout
+        )
+
+    def scroll_continuous(
+        self,
+        vertical_lines: float = 0.0,
+        horizontal_lines: float = 0.0,
+        *,
+        timeout: float = 1.0,
+    ) -> None:
+        """Emit continuous fractional-line scrolling through the owner thread."""
+        vertical_lines = validate_wayland_fixed(
+            vertical_lines,
+            "Vertical scroll lines",
+        )
+        horizontal_lines = validate_wayland_fixed(
+            horizontal_lines,
+            "Horizontal scroll lines",
+        )
+        vertical_distance = validate_wayland_fixed(
+            vertical_lines * _SCROLL_DISTANCE_PER_STEP,
+            "Vertical scroll distance",
+        )
+        horizontal_distance = validate_wayland_fixed(
+            horizontal_lines * _SCROLL_DISTANCE_PER_STEP,
+            "Horizontal scroll distance",
+        )
+        self._connection.execute(
+            lambda: self._emit_continuous_scroll(
+                vertical_distance,
+                horizontal_distance,
+            ),
+            timeout,
         )
 
     def _on_seat_changed(self) -> None:
@@ -555,6 +588,28 @@ class VirtualPointer:
                     horizontal,
                 )
             pointer.frame()
+        except Exception as exc:
+            self._connection.fail(exc)
+            raise
+
+    def _emit_continuous_scroll(
+        self,
+        vertical_distance: float,
+        horizontal_distance: float,
+    ) -> None:
+        """Emit each continuous axis as one independently sourced frame."""
+        pointer = self._require_pointer()
+        try:
+            for axis, distance in (
+                (_AXIS_VERTICAL, vertical_distance),
+                (_AXIS_HORIZONTAL, horizontal_distance),
+            ):
+                if distance == 0.0:
+                    continue
+                pointer.axis(self._timestamp_ms(), axis, distance)
+                # Virtual-pointer compositors attach the source to the current axis.
+                pointer.axis_source(_AXIS_SOURCE_CONTINUOUS)
+                pointer.frame()
         except Exception as exc:
             self._connection.fail(exc)
             raise

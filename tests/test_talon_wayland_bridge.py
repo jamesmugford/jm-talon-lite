@@ -143,6 +143,15 @@ class TalonWaylandBridgeTests(unittest.TestCase):
         self.module._fallback_held_keys.clear()
         self.module._publish_fallback_keys()
 
+    def test_continuous_scroll_action_delegates_to_desktop(self):
+        with patch.object(
+            self.module._bridge.desktop,
+            "scroll_pointer_continuous",
+        ) as scroll:
+            self.module.Actions.wayland_pointer_scroll_continuous(0.25, -0.5)
+
+        scroll.assert_called_once_with(0.25, -0.5)
+
     @classmethod
     def tearDownClass(cls):
         bridge = getattr(sys, "_jm_talon_lite_wayland_bridge", None)

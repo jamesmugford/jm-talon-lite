@@ -527,6 +527,12 @@ class Actions:
         """Scroll discrete steps through the native pointer."""
         _bridge.desktop.scroll_pointer(vertical_steps, horizontal_steps)
 
+    def wayland_pointer_scroll_continuous(
+        vertical_lines: float = 0.0, horizontal_lines: float = 0.0
+    ) -> None:
+        """Scroll fractional lines continuously through the native pointer."""
+        _bridge.desktop.scroll_pointer_continuous(vertical_lines, horizontal_lines)
+
     def wayland_pointer_modified_click(modifiers: str, button: int = 0) -> None:
         """Click while holding one Talon modifier chord."""
         _bridge.desktop.modified_click(modifiers, button)

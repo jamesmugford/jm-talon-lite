@@ -141,6 +141,13 @@ class WaylandDesktopTests(unittest.TestCase):
         start.assert_called_once_with(2)
         stop.assert_called_once_with(3)
 
+    def test_continuous_scroll_delegates_to_pointer(self):
+        desktop = WaylandDesktop()
+        with patch.object(desktop._pointer, "scroll_continuous") as scroll:
+            desktop.scroll_pointer_continuous(0.25, -0.5, timeout=2)
+
+        scroll.assert_called_once_with(0.25, -0.5, timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()

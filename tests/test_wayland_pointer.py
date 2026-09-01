@@ -142,6 +142,31 @@ class VirtualPointerTests(unittest.TestCase):
             ],
         )
 
+    def test_continuous_scroll_emits_each_axis_as_one_sourced_frame(self):
+        self.pointer_adapter.scroll_continuous(0.25, -0.5)
+
+        self.assertEqual(
+            self.pointer.calls,
+            [
+                ("axis", 1234, 0, 3.75),
+                ("axis_source", 2),
+                ("frame",),
+                ("axis", 1234, 1, -7.5),
+                ("axis_source", 2),
+                ("frame",),
+            ],
+        )
+
+    def test_continuous_scroll_validates_all_values_before_emitting(self):
+        with self.assertRaises(TypeError):
+            self.pointer_adapter.scroll_continuous(True)
+        with self.assertRaises(ValueError):
+            self.pointer_adapter.scroll_continuous(math.nan)
+        with self.assertRaises(ValueError):
+            self.pointer_adapter.scroll_continuous(WAYLAND_FIXED_MAX)
+
+        self.assertEqual(self.pointer.calls, [])
+
     def test_output_bound_motion_uses_selected_output_without_desktop_scaling(self):
         output = self._bind_output()
 
@@ -301,6 +326,19 @@ class VirtualPointerTests(unittest.TestCase):
         self.pointer_adapter.close()
         self.assertFalse(self.pointer_adapter.available())
 
+    def test_continuous_scroll_failure_stops_connection_without_replaying(self):
+        with patch.object(
+            self.pointer,
+            "axis_source",
+            side_effect=RuntimeError("source failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source failed"):
+                self.pointer_adapter.scroll_continuous(0.25)
+
+        self.assertEqual(self.pointer.calls, [("axis", 1234, 0, 3.75)])
+        self.assertTrue(self.connection.stopping)
+        self.assertEqual(str(self.connection.failures[0]), "source failed")
+
     def test_close_releases_manager_after_button_cleanup_failure(self):
         self.pointer_adapter.set_button(0, True)
         with patch.object(
@@ -356,10 +394,13 @@ class VirtualPointerTests(unittest.TestCase):
 
     def test_zero_scroll_validates_availability_without_emitting(self):
         self.pointer_adapter.scroll()
+        self.pointer_adapter.scroll_continuous()
         self.assertEqual(self.pointer.calls, [])
         self.pointer_adapter.close()
         with self.assertRaisesRegex(RuntimeError, "not available"):
             self.pointer_adapter.scroll()
+        with self.assertRaisesRegex(RuntimeError, "not available"):
+            self.pointer_adapter.scroll_continuous()
 
 
 if __name__ == "__main__":

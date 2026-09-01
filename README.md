@@ -34,7 +34,7 @@ know.
   mode. Gaze is mapped to Talon's main eye-mouse output, so additional monitors
   and compositor scaling do not change its position multipliers.
 - Mouse button and scrolling commands such as `touch`, `righty`, `drag`, and
-  `wheel up`
+  `wheel up`, including continuous fractional-line scrolling
 - Active Wayland application and window-title contexts
 - Optional compositor voice-command app layers (currently Hyprland, but more are to be added)
 
